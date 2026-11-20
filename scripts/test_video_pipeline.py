@@ -266,13 +266,16 @@ class VideoPipelineTests(unittest.TestCase):
     def test_retention_clips_repeat_short_source_to_match_target_duration(self) -> None:
         clips = choose_retention_clips(
             # [],
-            [_animated_moment(2.0, 0.9)],
-            video_duration=4.0,
+            # [_animated_moment(2.0, 0.9)],
+            # video_duration=4.0,
+            [_animated_moment(7.5, 0.9)],
+            video_duration=10.0,
             target_duration=10.0,
         )
 
         self.assertAlmostEqual(sum(clip.end - clip.start for clip in clips), 10.0)
-        self.assertTrue(all(0 <= clip.start < clip.end <= 4.0 for clip in clips))
+        # self.assertTrue(all(0 <= clip.start < clip.end <= 4.0 for clip in clips))
+        self.assertTrue(all(5.0 <= clip.start < clip.end <= 10.0 for clip in clips))
         self.assertGreater(len(clips), 1)
 
     def test_render_uses_narration_duration_for_repeated_clips(self) -> None:
@@ -429,7 +432,8 @@ class VideoPipelineTests(unittest.TestCase):
         rejected_end = 27.0
         clips = choose_retention_clips(
             [
-                _animated_moment(3.0, 0.8),
+                # _animated_moment(3.0, 0.8),
+                _animated_moment(10.0, 0.8),
                 _animated_moment(24.0, 0.99, suitable=False),
             ],
             video_duration=48.0,
@@ -503,6 +507,30 @@ class VideoPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(clips[0].start, 12.0)
+
+    def test_retention_excludes_first_and_last_five_seconds(self) -> None:
+        clips = choose_retention_clips(
+            [
+                _animated_moment(3.0, 0.99),
+                _animated_moment(10.0, 0.8),
+                _animated_moment(38.0, 0.99),
+            ],
+            video_duration=40.0,
+            target_duration=6.0,
+        )
+
+        self.assertEqual(len(clips), 1)
+        self.assertGreaterEqual(clips[0].start, 5.0)
+        self.assertLessEqual(clips[0].end, 35.0)
+
+    def test_content_bounds_exclude_outro_only_after_fifteen_seconds(self) -> None:
+        self.assertEqual(visual_analysis._content_time_bounds(15.0), (5.0, 15.0))
+        self.assertEqual(visual_analysis._content_time_bounds(16.0), (5.0, 11.0))
+
+    def test_verification_frames_are_sampled_within_the_segment(self) -> None:
+        frame_times = visual_analysis._verification_frame_times(10.0, 16.0)
+
+        self.assertEqual(frame_times, (12.1, 13.9))
 
     def test_story_prompt_uses_scene_and_requests_a_hook(self) -> None:
         scene = SceneAnalysis(
@@ -639,12 +667,18 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertIn("has_text=true", prompt)
         self.assertIn("is_animated=true", prompt)
-        self.assertIn("lettere, parole, frasi", prompt)
-        self.assertIn("sottotitoli, titoli, crediti, watermark", prompt)
-        self.assertIn("loghi con testo", prompt)
+        # self.assertIn("lettere, parole, frasi", prompt)
+        # self.assertIn("sottotitoli, titoli, crediti, watermark", prompt)
+        # self.assertIn("loghi con testo", prompt)
+        self.assertIn("area principale centrale", prompt)
+        self.assertIn("crop verticale 9:16", prompt)
+        self.assertIn("sottotitoli, fumetti con testo", prompt)
+        self.assertIn("Ignora piccoli watermark o firme", prompt)
+        self.assertIn("dettagli grafici decorativi dello sfondo", prompt)
         self.assertIn("non deve mai attenuare i controlli", prompt)
         # self.assertIn("sottotitoli", prompt)
-        self.assertIn("sottotitolo", prompt)
+        # self.assertIn("sottotitolo", prompt)
+        self.assertIn("sottotitoli", prompt)
         # self.assertIn("restituisci un momento per ogni immagine", prompt)
         self.assertIn("un elemento per ogni immagine", prompt)
         self.assertIn("scene_summary, actions e moments", prompt)
@@ -657,6 +691,21 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertTrue(
             visual_analysis._description_signals_visible_text(
                 "No text except subtitles."
+            )
+        )
+        self.assertFalse(
+            visual_analysis._description_signals_visible_text(
+                "Anime with a tiny watermark in the extreme upper-right corner."
+            )
+        )
+        self.assertTrue(
+            visual_analysis._description_signals_visible_text(
+                "Anime with subtitles and a tiny watermark in the extreme corner."
+            )
+        )
+        self.assertFalse(
+            visual_analysis._description_signals_visible_text(
+                "Decorative background markings in a hand-drawn anime scene."
             )
         )
 
@@ -689,6 +738,27 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
         self.assertTrue(scene.moments[1].has_text)
         self.assertFalse(visual_analysis._moment_is_safe_for_retention(scene.moments[1]))
+
+    def test_text_in_global_summary_does_not_contaminate_clean_frames(self) -> None:
+        scene = visual_analysis._normalize_vision_response(
+            {
+                "scene_summary": "An opening title appears before a clean animated story.",
+                "moments": [
+                    {
+                        "time_seconds": 12,
+                        "description": "Clean anime scene without visible text.",
+                        "has_text": False,
+                        "is_animated": True,
+                        "suitable": True,
+                    }
+                ],
+            },
+            duration=30.0,
+            timestamps=[12.0],
+        )
+
+        self.assertFalse(scene.moments[0].has_text)
+        self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
 
     def test_vision_response_rejects_only_empty_or_unusable_data(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "vuota o inutilizzabile"):
@@ -723,7 +793,8 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertTrue(visual_analysis._moment_is_safe_for_retention(scene.moments[0]))
         self.assertTrue(scene.moments[1].has_text)
         # self.assertFalse(scene.moments[1].is_animated)
-        self.assertTrue(scene.moments[1].is_animated)
+        # self.assertTrue(scene.moments[1].is_animated)
+        self.assertFalse(scene.moments[1].is_animated)
 
     def test_vision_description_only_moment_is_not_treated_as_empty(self) -> None:
         scene = visual_analysis._normalize_vision_response(
@@ -752,7 +823,13 @@ class VideoPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(len(scene.moments), 2)
-        self.assertTrue(
+        # self.assertTrue(
+        #     all(
+        #         visual_analysis._moment_is_safe_for_retention(moment)
+        #         for moment in scene.moments
+        #     )
+        # )
+        self.assertFalse(
             all(
                 visual_analysis._moment_is_safe_for_retention(moment)
                 for moment in scene.moments
@@ -770,7 +847,13 @@ class VideoPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(len(scene.moments), 3)
-        self.assertTrue(
+        # self.assertTrue(
+        #     all(
+        #         visual_analysis._moment_is_safe_for_retention(moment)
+        #         for moment in scene.moments
+        #     )
+        # )
+        self.assertFalse(
             all(
                 visual_analysis._moment_is_safe_for_retention(moment)
                 for moment in scene.moments

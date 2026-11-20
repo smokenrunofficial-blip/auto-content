@@ -38,6 +38,7 @@ NARRATION_MAX_WORDS = 115
 # NARRATION_WORD_COUNT_TOLERANCE = 3
 MIN_RETENTION_SUITABILITY_SCORE = 0.35
 RETENTION_EDGE_EXCLUSION_SECONDS = 8.0
+CONTENT_EDGE_EXCLUSION_SECONDS = 5.0
 MIN_CLIP_MOTION_SCORE = 0.003
 MIN_CLIP_MOTION_SAMPLES = 2
 BLACK_FRAME_MAX_MEAN = 4.0
@@ -73,6 +74,17 @@ NO_VISIBLE_TEXT_PATTERN = re.compile(
     r"\bnessun[oaie]?\s+testo\b|\bnessuna?\s+scritt[ae]\b",
     re.IGNORECASE,
 )
+IGNORABLE_CORNER_MARK_PATTERN = re.compile(
+    r"\b(?:tiny|small|little|minor|piccol[oaie]?|minut[oaie]?|minuscol[oaie]?)\b"
+    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
+    r".{0,80}\b(?:extreme\s+)?(?:upper[- ]|lower[- ])?(?:left|right)\s+corner\b|"
+    r"\b(?:tiny|small|little|minor|piccol[oaie]?|minut[oaie]?|minuscol[oaie]?)\b"
+    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
+    r".{0,80}\b(?:angol[oi]\s+(?:estrem[oaie]\s+)?(?:in\s+)?alto|"
+    r"angol[oi]\s+(?:estrem[oaie]\s+)?(?:in\s+)?basso|"
+    r"angol[oi]\s+(?:superiore|inferiore))\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -103,6 +115,13 @@ class SceneAnalysis:
 
 def _description_signals_visible_text(description: str) -> bool:
     for match in VISIBLE_TEXT_PATTERN.finditer(description):
+        matched_text = match.group().casefold()
+        context = description[max(0, match.start() - 80):match.end() + 80]
+        if (
+            re.fullmatch(r"(?:watermark|filigran\w*|signature|firma|firmetta)", matched_text)
+            and IGNORABLE_CORNER_MARK_PATTERN.search(context)
+        ):
+            continue
         prefix = description[max(0, match.start() - 48):match.start()]
         has_contrast = re.search(
             r"\b(?:but|ma|except|however|tranne|eccetto|però)\b",
@@ -125,6 +144,33 @@ def _description_signals_visible_text(description: str) -> bool:
                 continue
         return True
     return False
+
+
+def _content_time_bounds(duration: float) -> tuple[float, float]:
+    content_end = (
+        duration - CONTENT_EDGE_EXCLUSION_SECONDS
+        if duration > 15.0
+        else duration
+    )
+    return CONTENT_EDGE_EXCLUSION_SECONDS, content_end
+
+
+def _bounded_content_time_bounds(
+    duration: float,
+    bounds: tuple[float, float] | None = None,
+) -> tuple[float, float]:
+    default_start, default_end = _content_time_bounds(duration)
+    if bounds is None:
+        return default_start, default_end
+    return (
+        max(default_start, bounds[0]),
+        min(default_end, bounds[1]),
+    )
+
+
+def _verification_frame_times(start: float, end: float) -> tuple[float, float]:
+    duration = end - start
+    return start + 0.35 * duration, start + 0.65 * duration
 
 
 def _description_confirms_no_visible_text(description: str) -> bool:
@@ -304,12 +350,20 @@ def choose_retention_clips(
     video_duration: float,
     target_duration: float,
     clip_seconds: float = 6.0,
+    content_bounds: tuple[float, float] | None = None,
 ) -> list[Clip]:
     if video_duration <= 0 or target_duration <= 0:
         raise ValueError("La durata della narrazione e del video deve essere positiva.")
 
+    content_start, content_end = _bounded_content_time_bounds(
+        video_duration,
+        content_bounds,
+    )
+    if content_end <= content_start:
+        return []
     selection_duration = min(target_duration, video_duration)
-    window = min(clip_seconds, video_duration)
+    # window = min(clip_seconds, video_duration)
+    window = min(clip_seconds, content_end - content_start)
     ranked_samples = [
         sample
         if isinstance(sample, VisualMoment)
@@ -323,10 +377,19 @@ def choose_retention_clips(
     safe_samples = [
         sample
         for sample in ranked_samples
-        if sample.suitable and _moment_is_safe_for_retention(sample)
+        if (
+            sample.suitable
+            and _moment_is_safe_for_retention(sample)
+            and content_start <= sample.timestamp <= content_end
+        )
     ]
     rejected_samples = [
-        sample for sample in ranked_samples if sample not in safe_samples
+        sample
+        for sample in ranked_samples
+        if (
+            sample not in safe_samples
+            and content_start <= sample.timestamp <= content_end
+        )
     ]
     # Il fallback estetico usa solo momenti già verificati come animati e privi di testo.
     ranked_samples = safe_samples
@@ -334,7 +397,11 @@ def choose_retention_clips(
         return []
 
     def clip_for_sample(sample: VisualMoment) -> Clip:
-        start = max(0.0, min(sample.timestamp - window / 2, video_duration - window))
+        # start = max(0.0, min(sample.timestamp - window / 2, video_duration - window))
+        start = max(
+            content_start,
+            min(sample.timestamp - window / 2, content_end - window),
+        )
         return Clip(start, start + window, sample.score, sample.focus_x)
 
     interior_samples = [
@@ -1421,14 +1488,14 @@ def _normalize_vision_response(
             if clean_action:
                 clean_actions.append(clean_action)
     has_usable_actions = bool(clean_actions)
-    global_description = " ".join([summary or "", *clean_actions])
-    global_has_text = _description_signals_visible_text(global_description)
-    global_live_action = bool(LIVE_ACTION_PATTERN.search(global_description))
-    global_confirms_no_text = _description_confirms_no_visible_text(global_description)
-    global_confirms_animation = (
-        _description_confirms_animation(global_description)
-        and not global_live_action
-    )
+    # global_description = " ".join([summary or "", *clean_actions])
+    # global_has_text = _description_signals_visible_text(global_description)
+    # global_live_action = bool(LIVE_ACTION_PATTERN.search(global_description))
+    # global_confirms_no_text = _description_confirms_no_visible_text(global_description)
+    # global_confirms_animation = (
+    #     _description_confirms_animation(global_description)
+    #     and not global_live_action
+    # )
 
     # raw_moments = data.get("moments")
     # raw_moments = _find_vision_value(
@@ -1528,10 +1595,11 @@ def _normalize_vision_response(
                 ),
             )
             description = usable_text(raw_description, 400) or ""
-            has_text_default = not (
-                _description_confirms_no_visible_text(description)
-                or global_confirms_no_text
-            )
+            # has_text_default = not (
+            #     _description_confirms_no_visible_text(description)
+            #     or global_confirms_no_text
+            # )
+            has_text_default = not _description_confirms_no_visible_text(description)
             # has_text = (
             #     _parse_vision_boolean(moment.get("has_text"), default=True)
             #     or global_has_text
@@ -1542,7 +1610,7 @@ def _normalize_vision_response(
                     _find_vision_value(moment, ("has_text",)),
                     default=has_text_default,
                 )
-                or global_has_text
+                # or global_has_text
                 or _description_signals_visible_text(description)
             )
             # is_animated = _parse_vision_boolean(
@@ -1551,11 +1619,12 @@ def _normalize_vision_response(
             # ) and not global_live_action and not LIVE_ACTION_PATTERN.search(description)
             is_animated = _parse_vision_boolean(
                 _find_vision_value(moment, ("is_animated",)),
-                default=(
-                    _description_confirms_animation(description)
-                    or global_confirms_animation
-                ),
-            ) and not global_live_action and not LIVE_ACTION_PATTERN.search(description)
+                # default=(
+                #     _description_confirms_animation(description)
+                #     or global_confirms_animation
+                # ),
+                default=_description_confirms_animation(description),
+            ) and not LIVE_ACTION_PATTERN.search(description)
             suitable_value = _find_vision_value(moment, ("suitable", "is_suitable"))
             suitable = _parse_vision_boolean(
                 suitable_value,
@@ -1578,17 +1647,17 @@ def _normalize_vision_response(
                 )
 
     def fallback_moment(timestamp: float) -> VisualMoment:
-        fallback_has_text = global_has_text or not global_confirms_no_text
-        fallback_is_animated = global_confirms_animation and not global_live_action
-        fallback_description = global_description[:400]
+        # fallback_has_text = global_has_text or not global_confirms_no_text
+        # fallback_is_animated = global_confirms_animation and not global_live_action
+        # fallback_description = global_description[:400]
         return VisualMoment(
             timestamp,
             0.5,
             0.5,
-            fallback_is_animated and not fallback_has_text,
-            fallback_description,
-            fallback_has_text,
-            fallback_is_animated,
+            False,
+            "",
+            True,
+            False,
         )
 
     if not validated_moments:
@@ -1759,17 +1828,26 @@ def _build_vision_prompt(brief: str, frame_descriptions: list[str]) -> str:
         "Inserisci in moments un elemento per ogni immagine, nello stesso ordine e con "
         "il timestamp corrispondente. Ogni elemento deve avere time_seconds, description, "
         "has_text, is_animated, score, focus_x e suitable. "
-        "Controlla esplicitamente ogni area del fotogramma per qualsiasi testo visibile: "
-        "scritte, lettere, parole, frasi, sottotitoli, titoli, crediti, watermark e "
-        "loghi con testo, anche piccoli, parziali, sfocati o illeggibili. "
-        "has_text=true per qualsiasi scritta, sottotitolo, titolo, credito, watermark, "
-        "logo o testo parziale/illeggibile; usa false solo se l'assenza è chiara. "
+        # "Controlla esplicitamente ogni area del fotogramma per qualsiasi testo visibile: "
+        # "scritte, lettere, parole, frasi, sottotitoli, titoli, crediti, watermark e "
+        # "loghi con testo, anche piccoli, parziali, sfocati o illeggibili. "
+        # "has_text=true per qualsiasi scritta, sottotitolo, titolo, credito, watermark, "
+        # "logo o testo parziale/illeggibile; usa false solo se l'assenza è chiara. "
+        "Per has_text controlla SOLO l'area principale centrale che rimane nel crop "
+        "verticale 9:16, intorno al soggetto e all'azione: usa true SOLO se lì sono "
+        "chiaramente visibili titoli, sottotitoli, fumetti con testo o scritte evidenti "
+        "(parole o frasi), anche se parziali o sfocate. Ignora piccoli watermark o firme "
+        "nell'angolo estremo e dettagli grafici decorativi dello sfondo disegnato. "
+        "Usa has_text=false se il testo è assente dall'area centrale del crop. "
         "is_animated=true solo per cartoon, anime o animazione disegnata chiaramente; "
         "live-action, fotorealismo o dubbio significano false. suitable=true solo per "
         "un momento pertinente, animato e senza testo. score e focus_x sono numeri 0-1. "
         "Il punteggio estetico non deve mai attenuare i controlli su testo e animazione. "
-        "Descrivi solo elementi visibili; se un valore è incerto, usa il valore sicuro "
-        "(has_text=true, is_animated=false, suitable=false). "
+        # "Descrivi solo elementi visibili; se un valore è incerto, usa il valore sicuro "
+        # "(has_text=true, is_animated=false, suitable=false). "
+        "Descrivi solo elementi visibili; se non riesci a stabilire se una scritta "
+        "evidente si trovi nell'area centrale del crop, usa has_text=true; per dubbio "
+        "sullo stile usa is_animated=false e suitable=false. "
         "Esempio di forma: "
         '{"scene_summary":"Breve descrizione","actions":["azione visibile"],'
         '"moments":[{"time_seconds":12.0,"description":"Descrizione del fotogramma",'
@@ -1784,6 +1862,7 @@ def analyze_keyframes(
     video_path: Path,
     duration: float,
     brief: str = "",
+    content_bounds: tuple[float, float] | None = None,
 ) -> SceneAnalysis:
     try:
         import cv2
@@ -1802,8 +1881,16 @@ def analyze_keyframes(
     #         for index in range(9)
     #     }
     # )
+    content_start, content_end = _bounded_content_time_bounds(duration, content_bounds)
+    if content_end <= content_start:
+        raise RuntimeError("Il video non contiene fotogrammi candidati fuori da intro e outro.")
+    # timestamps = [
+    #     min(max(0.0, duration - 0.5), duration * index / (OLLAMA_MAX_VISION_FRAMES - 1))
+    #     for index in range(OLLAMA_MAX_VISION_FRAMES)
+    # ]
     timestamps = [
-        min(max(0.0, duration - 0.5), duration * index / (OLLAMA_MAX_VISION_FRAMES - 1))
+        content_start
+        + (index + 0.5) * (content_end - content_start) / OLLAMA_MAX_VISION_FRAMES
         for index in range(OLLAMA_MAX_VISION_FRAMES)
     ]
     if not timestamps:
@@ -1898,6 +1985,7 @@ def verify_retention_samples(
     video_duration: float,
     brief: str = "",
     clip_seconds: float = 6.0,
+    content_bounds: tuple[float, float] | None = None,
 ) -> list[VisualMoment]:
     try:
         import cv2
@@ -1906,7 +1994,12 @@ def verify_retention_samples(
             "OpenCV non è installato. Esegui: python -m pip install -r requirements-video.txt"
         ) from error
 
-    window = min(clip_seconds, video_duration)
+    content_start, content_end = _bounded_content_time_bounds(
+        video_duration,
+        content_bounds,
+    )
+    # window = min(clip_seconds, video_duration)
+    window = min(clip_seconds, max(0.0, content_end - content_start))
     if window <= 0:
         return samples
 
@@ -1923,21 +2016,40 @@ def verify_retention_samples(
         if not sample.suitable:
             reasons.append("momento non idoneo secondo Qwen")
         if reasons:
+            LOGGER.warning(
+                "Campione candidato a %.2fs scartato: is_animated=%s has_text=%s "
+                "suitable=%s; motivo=%s",
+                sample.timestamp,
+                sample.is_animated,
+                sample.has_text,
+                sample.suitable,
+                ", ".join(dict.fromkeys(reasons)),
+            )
             _report_frame_progress(
                 99,
-                f"Campione Qwen a {sample.timestamp:.2f}s SCARTATO: "
+                f"Campione Qwen a {sample.timestamp:.2f}s "
+                f"(is_animated={sample.is_animated}, has_text={sample.has_text}) "
+                f"SCARTATO: "
                 f"{', '.join(dict.fromkeys(reasons))}.",
             )
 
     safe_samples = [
         sample
         for sample in samples
-        if sample.suitable and _moment_is_safe_for_retention(sample)
+        if (
+            sample.suitable
+            and _moment_is_safe_for_retention(sample)
+            and content_start <= sample.timestamp <= content_end
+        )
     ]
     candidate_samples = safe_samples
 
     def clip_for_sample(sample: VisualMoment) -> Clip:
-        start = max(0.0, min(sample.timestamp - window / 2, video_duration - window))
+        # start = max(0.0, min(sample.timestamp - window / 2, video_duration - window))
+        start = max(
+            content_start,
+            min(sample.timestamp - window / 2, content_end - window),
+        )
         return Clip(start, start + window, sample.score, sample.focus_x)
 
     interior_samples = [
@@ -1979,11 +2091,12 @@ def verify_retention_samples(
                     f"({len(clip_motion)}/{MIN_CLIP_MOTION_SAMPLES} campioni)"
                 )
 
-            frame_count = min(OLLAMA_MAX_VISION_FRAMES, max(2, math.ceil(end - start)))
-            frame_times = [
-                start + (index + 0.5) * (end - start) / frame_count
-                for index in range(frame_count)
-            ]
+            # frame_count = min(OLLAMA_MAX_VISION_FRAMES, max(2, math.ceil(end - start)))
+            # frame_times = [
+            #     start + (index + 0.5) * (end - start) / frame_count
+            #     for index in range(frame_count)
+            # ]
+            frame_times = list(_verification_frame_times(start, end))
             encoded_frames: list[str] = []
             frame_descriptions: list[str] = []
             if not reason:
@@ -2043,6 +2156,18 @@ def verify_retention_samples(
                     ]
                     if unsafe_moments:
                         reasons: list[str] = []
+                        for moment in unsafe_moments:
+                            LOGGER.warning(
+                                "Scarto segmento %.2f-%.2fs: fotogramma a %.2fs "
+                                "is_animated=%s has_text=%s suitable=%s description=%r",
+                                start,
+                                end,
+                                moment.timestamp,
+                                moment.is_animated,
+                                moment.has_text,
+                                moment.suitable,
+                                moment.description,
+                            )
                         if any(moment.has_text for moment in unsafe_moments):
                             reasons.append("testo visibile")
                         if any(not moment.is_animated for moment in unsafe_moments):
@@ -2061,7 +2186,21 @@ def verify_retention_samples(
 
             if reason:
                 rejected_timestamps.update(sample.timestamp for sample in clip_samples)
-                status = f"SCARTATA: {reason}"
+                sample_details = ", ".join(
+                    f"{sample.timestamp:.2f}s(is_animated={sample.is_animated},"
+                    f"has_text={sample.has_text})"
+                    for sample in clip_samples
+                )
+                # status = f"SCARTATA: {reason}"
+                status = f"SCARTATA: {reason}; campioni Qwen: {sample_details}"
+                # LOGGER.warning("Scarto segmento %.2f-%.2fs: %s", start, end, reason)
+                LOGGER.warning(
+                    "Scarto segmento %.2f-%.2fs (campioni %s): %s",
+                    start,
+                    end,
+                    sample_details,
+                    reason,
+                )
             else:
                 status = "verificata: animazione senza testo e con movimento"
             _report_frame_progress(

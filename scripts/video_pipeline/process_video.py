@@ -21,6 +21,7 @@ from .visual_analysis import (
     analyze_video,
     choose_retention_clips,
     generate_storytelling_script,
+    _content_time_bounds,
     verify_retention_samples,
 )
 
@@ -99,8 +100,25 @@ def run_pipeline(
     if source_duration < 5:
         # raise ValueError("Il video deve durare almeno 5 secondi per generare una narrazione utile.")
         raise CandidateRejectedError("Il video è troppo corto per fornire clip utili.")
+    content_start, content_end = _content_time_bounds(source_duration)
+    if content_end <= content_start:
+        raise CandidateRejectedError(
+            "Il video non contiene segmenti candidati dopo l'esclusione di intro e outro."
+        )
+    # motion_samples sono raccolti sull'intero sorgente, ma intro/outro non sono candidati.
+    motion_samples = [
+        sample
+        for sample in motion_samples
+        if content_start <= sample.timestamp <= content_end
+    ]
     # scene = analyze_keyframes(source_path, source_duration)
-    scene = analyze_keyframes(source_path, source_duration, brief=brief)
+    # scene = analyze_keyframes(source_path, source_duration, brief=brief)
+    scene = analyze_keyframes(
+        source_path,
+        source_duration,
+        brief=brief,
+        content_bounds=(content_start, content_end),
+    )
     # retention_samples = motion_samples + list(scene.moments)
     # retention_samples = list(scene.moments) if scene.moments else motion_samples
     # retention_samples = list(scene.moments)
@@ -110,6 +128,7 @@ def run_pipeline(
         motion_samples,
         source_duration,
         brief=brief,
+        content_bounds=(content_start, content_end),
     )
     # initial_clips = choose_retention_clips(
     #     retention_samples,
@@ -120,6 +139,7 @@ def run_pipeline(
         retention_samples,
         source_duration,
         NARRATION_TARGET_SECONDS,
+        content_bounds=(content_start, content_end),
     )
     for index, clip in enumerate(initial_clips, start=1):
         report_progress(
