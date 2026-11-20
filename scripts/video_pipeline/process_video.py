@@ -129,17 +129,21 @@ def run_pipeline(
             f"Clip selezionata {index}/{len(initial_clips)}: "
             f"{clip.start:.2f}-{clip.end:.2f}s (score {clip.score:.2f}).",
         )
-    unique_clean_clips = {
-        (clip.start, clip.end)
+    # unique_clean_clips = {
+    #     (clip.start, clip.end)
+    #     for clip in initial_clips
+    # }
+    unique_clean_clip_starts = {
+        round(clip.start, 3)
         for clip in initial_clips
     }
-    if len(unique_clean_clips) < 2:
+    if len(unique_clean_clip_starts) < 2:
         # raise CandidateRejectedError(
         #     "Il video non contiene abbastanza segmenti animati verificati e senza testo."
         # )
         raise CandidateRejectedError(
             "Il video contiene "
-            f"{len(unique_clean_clips)} segmenti animati verificati e senza testo; "
+            f"{len(unique_clean_clip_starts)} segmenti animati verificati e senza testo; "
             "ne servono almeno 2."
         )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
