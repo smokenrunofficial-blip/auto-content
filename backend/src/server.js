@@ -17,6 +17,7 @@ const app = express();
 const execFileAsync = promisify(execFile);
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const downloaderPath = resolve(projectRoot, 'scripts', 'youtube_downloader.py');
+const VIDEO_CANDIDATE_LIMIT = 10;
 const scriptsDirectory = resolve(projectRoot, 'scripts');
 const downloadsDirectory = resolve(projectRoot, 'downloads');
 const processedDirectory = resolve(downloadsDirectory, 'processed');
@@ -367,7 +368,15 @@ function startVideoDownload(job, brief, language) {
     job,
     process.env.PYTHON_EXECUTABLE || 'python',
     // [downloaderPath, '--keyword', job.keyword, '--limit', '1', '--progress'],
-    [downloaderPath, '--keyword', job.keyword, '--limit', '3', '--progress'],
+    // [downloaderPath, '--keyword', job.keyword, '--limit', '3', '--progress'],
+    [
+      downloaderPath,
+      '--keyword',
+      job.keyword,
+      '--limit',
+      String(VIDEO_CANDIDATE_LIMIT),
+      '--progress',
+    ],
     projectRoot,
     async (event) => {
       if (!Array.isArray(event.videos) || event.videos.length === 0) {
@@ -401,6 +410,11 @@ function startVideoDownload(job, brief, language) {
       // startVideoProcessing(job, video.id, inputPath, brief, language);
       let candidateIndex = 0;
       const tryNextCandidate = async (rejectionReason) => {
+        if (rejectionReason) {
+          console.warn(
+            `Candidato ${job.videoId} rifiutato; provo il successivo: ${rejectionReason}`,
+          );
+        }
         if (candidateIndex >= event.videos.length) {
           failPipelineJob(
             job,
@@ -410,6 +424,7 @@ function startVideoDownload(job, brief, language) {
           return;
         }
 
+        const attemptNumber = candidateIndex + 1;
         const video = event.videos[candidateIndex++];
         if (
           !video ||
@@ -422,10 +437,24 @@ function startVideoDownload(job, brief, language) {
           //   .toLowerCase()
           //   .startsWith('creative commons attribution license')
         ) {
-          throw new Error('Il downloader non ha restituito un risultato valido.');
+          // throw new Error('Il downloader non ha restituito un risultato valido.');
+          await tryNextCandidate(
+            `Il candidato ${attemptNumber} non contiene metadati validi.`,
+          );
+          return;
         }
 
-        const inputPath = await findDownloadedVideo(video.id, video.file);
+        // const inputPath = await findDownloadedVideo(video.id, video.file);
+        let inputPath;
+        try {
+          inputPath = await findDownloadedVideo(video.id, video.file);
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : 'file video non valido';
+          await tryNextCandidate(
+            `Il file del candidato ${video.id} non è utilizzabile: ${reason}`,
+          );
+          return;
+        }
         job.videoId = video.id;
         job.video = {
           id: video.id,

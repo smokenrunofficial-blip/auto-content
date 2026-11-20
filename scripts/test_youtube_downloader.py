@@ -68,6 +68,103 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertFalse(has_allowed_license("Standard YouTube License"))
         self.assertFalse(has_allowed_license("Creative Commons Attribution"))
 
+    def test_select_candidates_fills_limit_from_lower_priority_tiers(self) -> None:
+        ideal = {
+            "id": "ideal12345",
+            "webpage_url": "https://youtube.com/watch?v=ideal12345",
+            "duration": 450,
+            "width": 1920,
+            "height": 1080,
+        }
+        standard = [
+            {
+                "id": f"standard{index:02d}",
+                "webpage_url": f"https://youtube.com/watch?v=standard{index:02d}",
+                "duration": 720,
+                "width": 1920,
+                "height": 1080,
+            }
+            for index in range(1, 10)
+        ]
+
+        selected = _select_candidates([*standard, ideal], 10)
+
+        self.assertEqual(len(selected), 10)
+        self.assertEqual(selected[0], ideal)
+
+    def test_main_accepts_ten_video_candidates(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                youtube_downloader.sys,
+                "argv",
+                ["youtube_downloader.py", "--keyword", "ceramica", "--limit", "10"],
+            ),
+            patch.object(youtube_downloader.sys, "stdout", stdout),
+            patch.object(youtube_downloader.sys, "stderr", stderr),
+            patch.object(youtube_downloader, "download_matches", return_value=[]) as download,
+        ):
+            result_code = youtube_downloader.main()
+
+        self.assertEqual(result_code, 0)
+        download.assert_called_once()
+        self.assertEqual(download.call_args.args[:2], ("ceramica", 10))
+        self.assertTrue(callable(download.call_args.args[2]))
+
+    def test_one_download_failure_does_not_stop_later_candidates(self) -> None:
+        attempted_downloads = []
+        video_metadata = {
+            video_id: {
+                "id": video_id,
+                "title": video_id,
+                "webpage_url": f"https://youtube.com/watch?v={video_id}",
+                "duration": 450,
+                "width": 1920,
+                "height": 1080,
+            }
+            for video_id in ("first12345", "second1234")
+        }
+
+        class FakeYouTubeDL:
+            def __init__(self, _options):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return not exc_info
+
+            def extract_info(self, url, download=False):
+                if url.startswith("ytsearch"):
+                    return {
+                        "entries": [
+                            {"webpage_url": metadata["webpage_url"]}
+                            for metadata in video_metadata.values()
+                        ]
+                    }
+
+                video_id = url.rsplit("=", 1)[-1]
+                metadata = dict(video_metadata[video_id])
+                if not download:
+                    return metadata
+                attempted_downloads.append(video_id)
+                if video_id == "first12345":
+                    raise youtube_downloader.yt_dlp.utils.DownloadError("non disponibile")
+                metadata["filepath"] = f"{video_id}.mp4"
+                return metadata
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(youtube_downloader, "DOWNLOAD_DIR", Path(temporary)),
+                patch.object(youtube_downloader.yt_dlp, "YoutubeDL", FakeYouTubeDL),
+            ):
+                videos = youtube_downloader.download_matches("ceramica", 2)
+
+        self.assertEqual(attempted_downloads, ["first12345", "second1234"])
+        self.assertEqual([video["id"] for video in videos], ["second1234"])
+
     def test_candidate_filters_duration_shorts_and_portrait_orientation(self) -> None:
         base = {
             "webpage_url": "https://youtube.com/watch?v=video12345",

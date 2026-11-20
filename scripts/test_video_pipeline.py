@@ -130,7 +130,8 @@ class VideoPipelineTests(unittest.TestCase):
                 patch.object(process_video, "OUTPUT_ROOT", Path(temporary)),
                 patch.object(process_video, "load_whisper_model") as load_whisper_model,
             ):
-                with self.assertRaises(process_video.CandidateRejectedError):
+                # with self.assertRaises(process_video.CandidateRejectedError):
+                with self.assertRaises(process_video.CandidateRejectedError) as rejected:
                     process_video.run_pipeline(
                         Path("source.mp4"),
                         "videoid1",
@@ -139,6 +140,8 @@ class VideoPipelineTests(unittest.TestCase):
                         True,
                     )
 
+        self.assertIn("[12.0s-18.0s]", str(rejected.exception))
+        self.assertIn("animated=True, has_text=False, score=0.90", str(rejected.exception))
         load_whisper_model.assert_not_called()
 
     def test_clip_verification_accepts_animated_text_free_frames(self) -> None:
@@ -670,11 +673,15 @@ class VideoPipelineTests(unittest.TestCase):
         # self.assertIn("lettere, parole, frasi", prompt)
         # self.assertIn("sottotitoli, titoli, crediti, watermark", prompt)
         # self.assertIn("loghi con testo", prompt)
-        self.assertIn("area principale centrale", prompt)
+        # self.assertIn("area principale centrale", prompt)
+        self.assertIn("fascia centrale dell'immagine", prompt)
         self.assertIn("crop verticale 9:16", prompt)
-        self.assertIn("sottotitoli, fumetti con testo", prompt)
-        self.assertIn("Ignora piccoli watermark o firme", prompt)
-        self.assertIn("dettagli grafici decorativi dello sfondo", prompt)
+        # self.assertIn("sottotitoli, fumetti con testo", prompt)
+        # self.assertIn("Ignora piccoli watermark o firme", prompt)
+        self.assertIn("Ignora piccoli loghi e watermark negli angoli", prompt)
+        self.assertIn("titoli, sottotitoli o scritte grandi", prompt)
+        # self.assertIn("dettagli grafici decorativi dello sfondo", prompt)
+        self.assertIn("dettagli grafici del disegno o dello sfondo", prompt)
         self.assertIn("non deve mai attenuare i controlli", prompt)
         # self.assertIn("sottotitoli", prompt)
         # self.assertIn("sottotitolo", prompt)
@@ -696,6 +703,11 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertFalse(
             visual_analysis._description_signals_visible_text(
                 "Anime with a tiny watermark in the extreme upper-right corner."
+            )
+        )
+        self.assertFalse(
+            visual_analysis._description_signals_visible_text(
+                "Anime with a small logo in the lower-left corner."
             )
         )
         self.assertTrue(

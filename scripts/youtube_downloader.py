@@ -15,7 +15,8 @@ import yt_dlp
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
-MAX_LIMIT = 3
+# MAX_LIMIT = 3
+MAX_LIMIT = 10
 MIN_SOURCE_VIDEO_DURATION_SECONDS = 60
 MAX_SOURCE_VIDEO_DURATION_SECONDS = 900
 IDEAL_SOURCE_VIDEO_DURATION_MIN_SECONDS = 300
@@ -114,6 +115,8 @@ def _select_candidates(
     candidates: list[dict[str, Any]],
     limit: int,
 ) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
     non_shorts = [
         candidate
         for candidate in candidates
@@ -130,12 +133,11 @@ def _select_candidates(
         <= (_positive_number(candidate.get("duration")) or 0)
         <= IDEAL_SOURCE_VIDEO_DURATION_MAX_SECONDS
     ]
-    if ideal_duration:
-        return sorted(
-            ideal_duration,
-            key=_candidate_priority,
-            reverse=True,
-        )[:limit]
+    sorted_ideal_duration = sorted(
+        ideal_duration,
+        key=_candidate_priority,
+        reverse=True,
+    )
 
     standard_duration = [
         candidate
@@ -144,12 +146,11 @@ def _select_candidates(
         <= (_positive_number(candidate.get("duration")) or 0)
         <= MAX_SOURCE_VIDEO_DURATION_SECONDS
     ]
-    if standard_duration:
-        return sorted(
-            standard_duration,
-            key=_candidate_priority,
-            reverse=True,
-        )[:limit]
+    sorted_standard_duration = sorted(
+        standard_duration,
+        key=_candidate_priority,
+        reverse=True,
+    )
 
     longer_videos = [
         candidate
@@ -157,13 +158,52 @@ def _select_candidates(
         if (_positive_number(candidate.get("duration")) or 0)
         > MAX_SOURCE_VIDEO_DURATION_SECONDS
     ]
-    if longer_videos:
-        return sorted(
-            longer_videos,
-            key=lambda candidate: _positive_number(candidate.get("duration")) or 0,
-        )[:limit]
-
-    return non_shorts[:limit]
+    sorted_longer_videos = sorted(
+        longer_videos,
+        key=lambda candidate: _positive_number(candidate.get("duration")) or 0,
+    )
+    # Preserve the old first-nonempty-tier behavior while filling the requested
+    # candidate limit from the next tiers when a preferred tier is too small.
+    # if ideal_duration:
+    #     return sorted(
+    #         ideal_duration,
+    #         key=_candidate_priority,
+    #         reverse=True,
+    #     )[:limit]
+    # if standard_duration:
+    #     return sorted(
+    #         standard_duration,
+    #         key=_candidate_priority,
+    #         reverse=True,
+    #     )[:limit]
+    # if longer_videos:
+    #     return sorted(
+    #         longer_videos,
+    #         key=lambda candidate: _positive_number(candidate.get("duration")) or 0,
+    #     )[:limit]
+    # return non_shorts[:limit]
+    ordered_candidates = (
+        sorted_ideal_duration
+        + sorted_standard_duration
+        + sorted_longer_videos
+        + sorted(non_shorts, key=_candidate_priority, reverse=True)
+    )
+    selected: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for candidate in ordered_candidates:
+        candidate_url = str(candidate.get("webpage_url") or candidate.get("url") or "")
+        candidate_key = (
+            candidate_url
+            or str(candidate.get("id") or "")
+            or str(id(candidate))
+        )
+        if candidate_key in seen_urls:
+            continue
+        seen_urls.add(candidate_key)
+        selected.append(candidate)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def _candidate_match_filter(
@@ -223,7 +263,23 @@ def download_matches(
                 continue
             if _is_shorts_url(entry_url) or _is_shorts_url(str(entry.get("url", ""))):
                 continue
-            metadata = searcher.extract_info(entry_url, download=False)
+            # metadata = searcher.extract_info(entry_url, download=False)
+            try:
+                metadata = searcher.extract_info(entry_url, download=False)
+            except (OSError, yt_dlp.utils.DownloadError) as error:
+                metadata = dict(entry)
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "type": "progress",
+                            "stage": "search",
+                            "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
+                            "message": (
+                                f"Metadati candidato {index + 1}/{len(entries)} "
+                                f"non disponibili; uso i dati della ricerca ({error})."
+                            ),
+                        }
+                    )
             if not isinstance(metadata, dict) or not metadata:
                 # Keep the usable search result as a last-resort candidate.
                 metadata = dict(entry)
@@ -259,7 +315,10 @@ def download_matches(
                 "type": "progress",
                 "stage": "search",
                 "stage_progress": 100,
-                "message": "Ricerca completata; selezionato il primo risultato idoneo.",
+                # "message": "Ricerca completata; selezionato il primo risultato idoneo.",
+                "message": (
+                    f"Ricerca completata; selezionati {len(candidates)} candidati da provare."
+                ),
             }
         )
 
@@ -319,12 +378,38 @@ def download_matches(
     if progress_callback:
         download_options["progress_hooks"] = [report_download_progress]
     downloaded: list[dict[str, str]] = []
+    download_failures: list[str] = []
 
     with yt_dlp.YoutubeDL(download_options) as downloader:
-        for candidate in candidates:
-            info = downloader.extract_info(candidate["webpage_url"], download=True)
-            if not info:
-                raise RuntimeError(f"yt-dlp non ha restituito i dati per {candidate['webpage_url']}")
+        # for candidate in candidates:
+        for candidate_index, candidate in enumerate(candidates, start=1):
+            candidate_url = str(candidate.get("webpage_url", ""))
+            try:
+                info = downloader.extract_info(candidate_url, download=True)
+            except (OSError, yt_dlp.utils.DownloadError) as error:
+                download_failures.append(f"{candidate_url}: {error}")
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "type": "progress",
+                            "stage": "download",
+                            "stage_progress": int(candidate_index * 100 / len(candidates)),
+                            "message": (
+                                f"Download candidato {candidate_index}/{len(candidates)} "
+                                f"non riuscito; provo il successivo."
+                            ),
+                        }
+                    )
+                continue
+            # if not info:
+            #     raise RuntimeError(
+            #         f"yt-dlp non ha restituito i dati per {candidate['webpage_url']}"
+            #     )
+            if not isinstance(info, dict) or not info:
+                download_failures.append(
+                    f"{candidate_url}: yt-dlp non ha restituito i dati del video"
+                )
+                continue
             license_name = info.get("license")
             # if not has_allowed_license(license_name):
             #     raise RuntimeError(
@@ -340,6 +425,12 @@ def download_matches(
                 }
             )
 
+    if not downloaded and download_failures:
+        raise RuntimeError(
+            "Nessun candidato è stato scaricato. "
+            + " | ".join(download_failures[:3])
+        )
+
     return downloaded
 
 
@@ -350,7 +441,8 @@ def main() -> int:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", required=True, help="Parola chiave o nicchia da cercare")
-    parser.add_argument("--limit", type=int, default=2, help="Numero massimo di download (1-3)")
+    # parser.add_argument("--limit", type=int, default=2, help="Numero massimo di download (1-3)")
+    parser.add_argument("--limit", type=int, default=2, help="Numero massimo di candidati (1-10)")
     parser.add_argument(
         "--progress",
         action="store_true",

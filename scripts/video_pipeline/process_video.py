@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import re
 import sys
@@ -34,6 +35,7 @@ ALLOWED_LANGUAGES = {"de", "en", "es", "fr", "it", "pt"}
 NARRATION_TARGET_SECONDS = 35.0
 NARRATION_MIN_SECONDS = 30.0
 NARRATION_MAX_SECONDS = 40.0
+LOGGER = logging.getLogger(__name__)
 
 
 class CandidateRejectedError(RuntimeError):
@@ -158,13 +160,40 @@ def run_pipeline(
         for clip in initial_clips
     }
     if len(unique_clean_clip_starts) < 2:
+        diagnostic_window = min(6.0, content_end - content_start)
+        diagnostic_rows: list[str] = []
+        for sample in retention_samples:
+            segment_start = max(
+                content_start,
+                min(
+                    sample.timestamp - diagnostic_window / 2,
+                    content_end - diagnostic_window,
+                ),
+            )
+            segment_end = segment_start + diagnostic_window
+            diagnostic_rows.append(
+                f"[{segment_start:.1f}s-{segment_end:.1f}s] "
+                f"animated={sample.is_animated}, has_text={sample.has_text}, "
+                f"score={sample.score:.2f}, suitable={sample.suitable}"
+            )
+        segment_summary = "; ".join(diagnostic_rows) or "nessun campione classificato"
+        LOGGER.warning(
+            "Candidato %s rifiutato: segmenti analizzati: %s",
+            video_id,
+            segment_summary,
+        )
         # raise CandidateRejectedError(
         #     "Il video non contiene abbastanza segmenti animati verificati e senza testo."
         # )
+        # raise CandidateRejectedError(
+        #     "Il video contiene "
+        #     f"{len(unique_clean_clip_starts)} segmenti animati verificati e senza testo; "
+        #     "ne servono almeno 2."
+        # )
         raise CandidateRejectedError(
-            "Il video contiene "
-            f"{len(unique_clean_clip_starts)} segmenti animati verificati e senza testo; "
-            "ne servono almeno 2."
+            f"Il video contiene {len(unique_clean_clip_starts)} segmenti animati "
+            "verificati e senza testo; ne servono almeno 2. "
+            f"Segmenti analizzati: {segment_summary}."
         )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     output_directory = Path(

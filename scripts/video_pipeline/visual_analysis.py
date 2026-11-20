@@ -75,11 +75,13 @@ NO_VISIBLE_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 IGNORABLE_CORNER_MARK_PATTERN = re.compile(
+    # r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
     r"\b(?:tiny|small|little|minor|piccol[oaie]?|minut[oaie]?|minuscol[oaie]?)\b"
-    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
+    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta|logo|loghi)\b"
     r".{0,80}\b(?:extreme\s+)?(?:upper[- ]|lower[- ])?(?:left|right)\s+corner\b|"
+    # r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
     r"\b(?:tiny|small|little|minor|piccol[oaie]?|minut[oaie]?|minuscol[oaie]?)\b"
-    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta)\b"
+    r".{0,80}\b(?:watermark|filigran\w*|signature|firma|firmetta|logo|loghi)\b"
     r".{0,80}\b(?:angol[oi]\s+(?:estrem[oaie]\s+)?(?:in\s+)?alto|"
     r"angol[oi]\s+(?:estrem[oaie]\s+)?(?:in\s+)?basso|"
     r"angol[oi]\s+(?:superiore|inferiore))\b",
@@ -118,7 +120,11 @@ def _description_signals_visible_text(description: str) -> bool:
         matched_text = match.group().casefold()
         context = description[max(0, match.start() - 80):match.end() + 80]
         if (
-            re.fullmatch(r"(?:watermark|filigran\w*|signature|firma|firmetta)", matched_text)
+            # re.fullmatch(r"(?:watermark|filigran\w*|signature|firma|firmetta)", matched_text)
+            re.fullmatch(
+                r"(?:watermark|filigran\w*|signature|firma|firmetta|logo|loghi)",
+                matched_text,
+            )
             and IGNORABLE_CORNER_MARK_PATTERN.search(context)
         ):
             continue
@@ -1833,11 +1839,15 @@ def _build_vision_prompt(brief: str, frame_descriptions: list[str]) -> str:
         # "loghi con testo, anche piccoli, parziali, sfocati o illeggibili. "
         # "has_text=true per qualsiasi scritta, sottotitolo, titolo, credito, watermark, "
         # "logo o testo parziale/illeggibile; usa false solo se l'assenza è chiara. "
-        "Per has_text controlla SOLO l'area principale centrale che rimane nel crop "
-        "verticale 9:16, intorno al soggetto e all'azione: usa true SOLO se lì sono "
-        "chiaramente visibili titoli, sottotitoli, fumetti con testo o scritte evidenti "
-        "(parole o frasi), anche se parziali o sfocate. Ignora piccoli watermark o firme "
-        "nell'angolo estremo e dettagli grafici decorativi dello sfondo disegnato. "
+        # "Per has_text controlla SOLO l'area principale centrale che rimane nel crop "
+        # "verticale 9:16, intorno al soggetto e all'azione: usa true SOLO se lì sono "
+        # "chiaramente visibili titoli, sottotitoli, fumetti con testo o scritte evidenti "
+        # "(parole o frasi), anche se parziali o sfocate. Ignora piccoli watermark o firme "
+        # "nell'angolo estremo e dettagli grafici decorativi dello sfondo disegnato. "
+        "Per has_text usa true SOLO se nella fascia centrale dell'immagine, inclusa "
+        "nell'area del crop verticale 9:16, sono chiaramente visibili titoli, sottotitoli "
+        "o scritte grandi. Ignora piccoli loghi e watermark negli angoli e i dettagli "
+        "grafici del disegno o dello sfondo. "
         "Usa has_text=false se il testo è assente dall'area centrale del crop. "
         "is_animated=true solo per cartoon, anime o animazione disegnata chiaramente; "
         "live-action, fotorealismo o dubbio significano false. suitable=true solo per "
@@ -2073,6 +2083,7 @@ def verify_retention_samples(
 
     capture = _open_video_capture(cv2, video_path)
     rejected_timestamps: set[float] = set()
+    verified_sample_flags: dict[float, tuple[bool, bool]] = {}
     try:
         for clip_number, ((start, end), clip_samples) in enumerate(
             sorted(clips_to_samples.items()),
@@ -2149,6 +2160,22 @@ def verify_retention_samples(
                 if len(verification.moments) != len(frame_times):
                     reason = "Qwen non ha classificato tutti i fotogrammi del segmento"
                 else:
+                    verified_has_text = any(
+                        moment.has_text
+                        or _description_signals_visible_text(moment.description)
+                        for moment in verification.moments
+                    )
+                    verified_is_animated = all(
+                        moment.is_animated
+                        and not LIVE_ACTION_PATTERN.search(moment.description)
+                        for moment in verification.moments
+                    )
+                    verified_sample_flags.update(
+                        {
+                            sample.timestamp: (verified_has_text, verified_is_animated)
+                            for sample in clip_samples
+                        }
+                    )
                     unsafe_moments = [
                         moment
                         for moment in verification.moments
@@ -2215,12 +2242,21 @@ def verify_retention_samples(
     finally:
         capture.release()
 
-    return [
-        replace(sample, suitable=False)
-        if sample.timestamp in rejected_timestamps
-        else sample
-        for sample in samples
-    ]
+    # return [
+    #     replace(sample, suitable=False)
+    #     if sample.timestamp in rejected_timestamps
+    #     else sample
+    #     for sample in samples
+    # ]
+    def update_verified_sample(sample: VisualMoment) -> VisualMoment:
+        flags = verified_sample_flags.get(sample.timestamp)
+        if flags is not None:
+            sample = replace(sample, has_text=flags[0], is_animated=flags[1])
+        if sample.timestamp in rejected_timestamps:
+            sample = replace(sample, suitable=False)
+        return sample
+
+    return [update_verified_sample(sample) for sample in samples]
 
 
 def _truncate_narration_to_word_limit(text: str, max_words: int) -> str:
