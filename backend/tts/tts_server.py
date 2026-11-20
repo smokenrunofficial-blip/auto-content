@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Optional
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -82,6 +83,7 @@ DEFAULT_MODEL_NAMES = [
     "it_IT-paola-medium.onnx",
     "it_IT-riccardo-medium.onnx",
 ]
+DEFAULT_PIPER_LENGTH_SCALE = 1.18
 DATA_DIR = BASE_DIR / "data"
 SETTINGS_FILE = DATA_DIR / "profile_settings.json"
 
@@ -118,6 +120,26 @@ class SettingsPayload(BaseModel):
     dark_mode: bool = True
     auto_save: bool = True
     notifications: bool = True
+
+
+def _configured_piper_length_scale() -> float:
+    raw_value = os.environ.get(
+        "PIPER_LENGTH_SCALE",
+        str(DEFAULT_PIPER_LENGTH_SCALE),
+    )
+    try:
+        length_scale = float(raw_value)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="PIPER_LENGTH_SCALE deve essere un numero positivo.",
+        ) from error
+    if not math.isfinite(length_scale) or length_scale <= 0:
+        raise HTTPException(
+            status_code=500,
+            detail="PIPER_LENGTH_SCALE deve essere un numero positivo.",
+        )
+    return length_scale
 
 
 def ensure_store_file() -> None:
@@ -266,6 +288,7 @@ def synth(req: TTSRequest):
     try:
         model_path = resolve_model_path()
         espeak_data = PIPER_DIR / "espeak-ng-data"
+        length_scale = _configured_piper_length_scale()
 
         temp_file = None
         try:
@@ -279,6 +302,7 @@ def synth(req: TTSRequest):
                 "--output_file",
                 str(temp_file),
             ]
+            command.extend(["--length_scale", f"{length_scale:g}"])
 
             if os.name == "nt" and espeak_data.exists():
                 command.extend(["--espeak_data", str(espeak_data)])

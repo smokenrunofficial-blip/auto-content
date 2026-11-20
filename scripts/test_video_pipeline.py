@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request
@@ -16,7 +17,14 @@ from video_pipeline.captions import write_word_captions
 from video_pipeline import captions
 from video_pipeline import process_video
 from video_pipeline import speech
-from video_pipeline.render import render_vertical_short
+# from video_pipeline.render import render_vertical_short
+from video_pipeline.render import (
+    _detect_face_focus_tracks,
+    _fallback_focus_tracks,
+    _focus_track_expression,
+    _smooth_focus_track,
+    render_vertical_short,
+)
 from video_pipeline import visual_analysis
 from video_pipeline.process_video import validate_input
 from video_pipeline.visual_analysis import (
@@ -326,6 +334,90 @@ class VideoPipelineTests(unittest.TestCase):
             [(5.0, 8.0), (8.5, 11.5)],
         )
 
+    def test_face_focus_smoothing_limits_crop_jumps(self) -> None:
+        track = _smooth_focus_track(
+            [0.0, 0.5, 1.0],
+            [0.2, 0.9, 0.8],
+            fallback_focus=0.5,
+            previous_focus=0.5,
+        )
+        focus_values = [focus for _time, focus in track]
+
+        self.assertEqual(focus_values[0], 0.5)
+        self.assertTrue(all(0.0 <= focus <= 1.0 for focus in focus_values))
+        self.assertTrue(
+            all(
+                abs(current - previous) <= 0.12
+                for previous, current in zip(focus_values, focus_values[1:])
+            )
+        )
+
+    def test_face_focus_fallback_stays_centered_and_builds_time_expression(self) -> None:
+        tracks = _fallback_focus_tracks(
+            [Clip(0.0, 3.0, 0.5, focus_x=0.95)],
+            focus_x=0.95,
+        )
+        expression = _focus_track_expression(tracks[0])
+
+        self.assertTrue(all(0.38 <= focus <= 0.62 for _, focus in tracks[0]))
+        self.assertIn("if(lt(t,", expression)
+        self.assertIn("0.000000", expression)
+
+    def test_face_detector_tracks_a_face_inside_each_clip(self) -> None:
+        class FakeFrame:
+            shape = (100, 200, 3)
+
+        class FakeGray:
+            shape = (100, 200)
+
+        class FakeCapture:
+            def isOpened(self) -> bool:
+                return True
+
+            def set(self, *_arguments: Any) -> bool:
+                return True
+
+            def read(self) -> tuple[bool, FakeFrame]:
+                return True, FakeFrame()
+
+            def release(self) -> None:
+                return None
+
+        class FakeDetector:
+            def empty(self) -> bool:
+                return False
+
+            def detectMultiScale(
+                self,
+                *_arguments: Any,
+                **_options: Any,
+            ) -> list[tuple[int, int, int, int]]:
+                return [(100, 20, 40, 40)]
+
+        fake_cv2 = SimpleNamespace(
+            data=SimpleNamespace(haarcascades="/fake/cascades/"),
+            error=RuntimeError,
+            CAP_PROP_POS_MSEC=0,
+            COLOR_BGR2GRAY=1,
+            CascadeClassifier=lambda _path: FakeDetector(),
+            VideoCapture=lambda _path: FakeCapture(),
+            cvtColor=lambda _frame, _mode: FakeGray(),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            source_path = Path(temporary) / "source.mp4"
+            source_path.touch()
+            with patch.dict("sys.modules", {"cv2": fake_cv2}):
+                tracks = _detect_face_focus_tracks(
+                    source_path,
+                    [Clip(0.0, 1.0, 0.9)],
+                    focus_x=0.5,
+                )
+
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(len(tracks[0]), 3)
+        self.assertGreater(tracks[0][-1][1], tracks[0][0][1])
+        self.assertLessEqual(tracks[0][-1][1], 0.62)
+
     def test_render_uses_narration_duration_for_repeated_clips(self) -> None:
         clips = [Clip(0.0, 4.0, 0.0), Clip(0.0, 4.0, 0.0), Clip(0.0, 2.0, 0.0)]
         with tempfile.TemporaryDirectory() as temporary:
@@ -333,6 +425,14 @@ class VideoPipelineTests(unittest.TestCase):
                 patch(
                     "video_pipeline.render.MUSIC_DIRECTORY",
                     Path(temporary) / "empty-music",
+                ),
+                patch(
+                    "video_pipeline.render._detect_face_focus_tracks",
+                    return_value=[
+                        [(0.0, 0.4), (4.0, 0.6)],
+                        [(0.0, 0.6), (4.0, 0.5)],
+                        [(0.0, 0.5), (2.0, 0.5)],
+                    ],
                 ),
                 patch("video_pipeline.render._measure_audio_peak", return_value=-12.0),
                 patch(
@@ -363,6 +463,8 @@ class VideoPipelineTests(unittest.TestCase):
         # self.assertIn("[video]subtitles=captions.ass[output]", filter_graph)
         self.assertIn("[video]subtitles=filename='captions.ass':", filter_graph)
         self.assertIn("fontsdir=", filter_graph)
+        self.assertIn("if(lt(t,4.000000)", filter_graph)
+        self.assertIn("iw*(if", filter_graph)
         # self.assertIn("[1:a]anull[finalaudio]", filter_graph)
         self.assertIn("[1:a]loudnorm=I=-16:TP=-1.5:LRA=7[finalaudio]", filter_graph)
         self.assertIn("[finalaudio]", command)
@@ -612,6 +714,34 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertIn("gancio forte", prompt)
         self.assertIn(scene.summary, prompt)
         self.assertIn(scene.actions[0], prompt)
+
+    def test_story_prompt_requests_a_complete_horror_story_from_the_premise(self) -> None:
+        scene = SceneAnalysis(
+            summary="Una strada vuota nella nebbia.",
+            actions=("Una luce si spegne in fondo alla strada.",),
+            moments=(VisualMoment(12.0, 0.9, 0.5),),
+        )
+        narration = " ".join(f"parola{index}" for index in range(100))
+        with patch(
+            "video_pipeline.visual_analysis._call_ollama",
+            return_value={"narration": narration},
+        ) as ollama:
+            result = generate_storytelling_script(
+                "Una telefonata arriva da una casa abbandonata.",
+                scene,
+                "",
+                target_duration=50.0,
+                language="it",
+            )
+
+        prompt = ollama.call_args.args[0]
+        self.assertEqual(result, narration)
+        self.assertIn("senza ripeterlo o parafrasarlo", prompt)
+        self.assertIn("storia horror originale, completa e coerente", prompt)
+        self.assertIn("tensione che cresce e un finale d'effetto", prompt)
+        self.assertIn("90-125 parole", prompt)
+        self.assertIn("40-60 secondi", prompt)
+        self.assertIn("senza didascalie", prompt)
 
     def test_story_recovers_text_from_alternative_and_nested_keys(self) -> None:
         scene = SceneAnalysis(
@@ -1118,7 +1248,8 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertIn(feedback, ollama.call_args.args[0])
 
-    def test_long_story_retries_short_output_and_targets_75_to_115_words(self) -> None:
+    # def test_long_story_retries_short_output_and_targets_75_to_115_words(self) -> None:
+    def test_long_story_retries_short_output_and_targets_90_to_125_words(self) -> None:
         scene = SceneAnalysis(
             summary="Una pressa idraulica schiaccia oggetti.",
             actions=("La pressa comprime una serie di oggetti.",),
@@ -1143,9 +1274,11 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(result, narration)
         self.assertEqual(ollama.call_count, 2)
         # self.assertIn("75-115 parole", ollama.call_args_list[1].args[0])
+        # self.assertIn("90-95 parole", ollama.call_args_list[1].args[0])
+        self.assertIn("almeno 90 e al massimo 125 parole", ollama.call_args_list[1].args[0])
         self.assertIn("conteggio esatto della bozza precedente è 3 parole", ollama.call_args_list[1].args[0])
         self.assertIn("È troppo breve", ollama.call_args_list[1].args[0])
-        self.assertIn("90-95 parole", ollama.call_args_list[1].args[0])
+        self.assertIn("102-107 parole", ollama.call_args_list[1].args[0])
 
     def test_long_story_uses_third_attempt_for_word_count_compliance(self) -> None:
         scene = SceneAnalysis(
@@ -1154,7 +1287,8 @@ class VideoPipelineTests(unittest.TestCase):
             moments=(VisualMoment(3.0, 0.9, 0.5),),
         )
         valid_narration = " ".join(f"parola{index}" for index in range(90))
-        too_long_narration = " ".join(f"parola{index}" for index in range(120))
+        # too_long_narration = " ".join(f"parola{index}" for index in range(120))
+        too_long_narration = " ".join(f"parola{index}" for index in range(130))
         with patch(
             "video_pipeline.visual_analysis._call_ollama",
             side_effect=[
@@ -1174,9 +1308,11 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(result, valid_narration)
         self.assertEqual(ollama.call_count, 3)
         third_prompt = ollama.call_args_list[2].args[0]
-        self.assertIn("almeno 75 e al massimo 115 parole", third_prompt)
+        # self.assertIn("almeno 75 e al massimo 115 parole", third_prompt)
+        self.assertIn("almeno 90 e al massimo 125 parole", third_prompt)
         # self.assertIn("120 parole", third_prompt)
-        self.assertIn("conteggio esatto della bozza precedente è 120 parole", third_prompt)
+        # self.assertIn("conteggio esatto della bozza precedente è 120 parole", third_prompt)
+        self.assertIn("conteggio esatto della bozza precedente è 130 parole", third_prompt)
         self.assertIn("È troppo lunga", third_prompt)
 
     # def test_long_story_accepts_small_word_count_deviation_after_retries(self) -> None:
@@ -1187,8 +1323,10 @@ class VideoPipelineTests(unittest.TestCase):
             moments=(VisualMoment(3.0, 0.9, 0.5),),
         )
         short_draft = " ".join(f"parola{index}" for index in range(72)) + "."
-        long_draft = " ".join(f"parola{index}" for index in range(120)) + "."
-        near_limit_draft = " ".join(f"parola{index}" for index in range(118)) + "."
+        # long_draft = " ".join(f"parola{index}" for index in range(120)) + "."
+        # near_limit_draft = " ".join(f"parola{index}" for index in range(118)) + "."
+        long_draft = " ".join(f"parola{index}" for index in range(130)) + "."
+        near_limit_draft = " ".join(f"parola{index}" for index in range(128)) + "."
         with patch(
             "video_pipeline.visual_analysis._call_ollama",
             side_effect=[
@@ -1209,7 +1347,8 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(result, short_draft)
         self.assertEqual(ollama.call_count, 3)
         self.assertIn("72 parole", ollama.call_args_list[1].args[0])
-        self.assertIn("120 parole", ollama.call_args_list[2].args[0])
+        # self.assertIn("120 parole", ollama.call_args_list[2].args[0])
+        self.assertIn("130 parole", ollama.call_args_list[2].args[0])
 
     def test_long_story_accepts_small_shortfall_after_retries(self) -> None:
         scene = SceneAnalysis(
@@ -1217,7 +1356,8 @@ class VideoPipelineTests(unittest.TestCase):
             actions=("La pressa comprime un oggetto.",),
             moments=(VisualMoment(3.0, 0.9, 0.5),),
         )
-        near_minimum_draft = " ".join(f"parola{index}" for index in range(72)) + "."
+        # near_minimum_draft = " ".join(f"parola{index}" for index in range(72)) + "."
+        near_minimum_draft = " ".join(f"parola{index}" for index in range(88)) + "."
         with patch(
             "video_pipeline.visual_analysis._call_ollama",
             return_value={"narration": near_minimum_draft},
@@ -1266,14 +1406,17 @@ class VideoPipelineTests(unittest.TestCase):
         )
         complete_sentence = " ".join(f"parola{index}" for index in range(110)) + "."
         closest_draft = complete_sentence + " " + " ".join(
-            f"extra{index}" for index in range(6)
+            # f"extra{index}" for index in range(6)
+            f"extra{index}" for index in range(20)
         )
         with patch(
             "video_pipeline.visual_analysis._call_ollama",
             side_effect=[
-                {"narration": " ".join(f"a{index}" for index in range(120))},
+                # {"narration": " ".join(f"a{index}" for index in range(120))},
+                {"narration": " ".join(f"a{index}" for index in range(132))},
                 {"narration": closest_draft},
-                {"narration": " ".join(f"b{index}" for index in range(118))},
+                # {"narration": " ".join(f"b{index}" for index in range(118))},
+                {"narration": " ".join(f"b{index}" for index in range(140))},
             ],
         ) as ollama:
             result = generate_storytelling_script(
@@ -1290,12 +1433,15 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertTrue(result.endswith("."))
 
     def test_long_narration_truncation_keeps_last_whole_word_if_no_sentence_ends(self) -> None:
-        draft = " ".join(f"parola{index}" for index in range(120))
+        # draft = " ".join(f"parola{index}" for index in range(120))
+        draft = " ".join(f"parola{index}" for index in range(130))
 
-        truncated = visual_analysis._truncate_narration_to_word_limit(draft, 115)
+        # truncated = visual_analysis._truncate_narration_to_word_limit(draft, 115)
+        truncated = visual_analysis._truncate_narration_to_word_limit(draft, 125)
 
-        self.assertEqual(len(truncated.split()), 115)
-        self.assertEqual(truncated.split()[-1], "parola114.")
+        # self.assertEqual(len(truncated.split()), 115)
+        self.assertEqual(len(truncated.split()), 125)
+        self.assertEqual(truncated.split()[-1], "parola124.")
 
     # def test_pipeline_retries_for_target_audio_and_repeats_short_source(self) -> None:
     def test_pipeline_retries_for_target_audio_with_temporal_animation_cuts(self) -> None:
@@ -1379,7 +1525,8 @@ class VideoPipelineTests(unittest.TestCase):
                 patch.object(
                     process_video,
                     "audio_duration",
-                    side_effect=[28.0, 42.0, 36.0],
+                    # side_effect=[28.0, 42.0, 36.0],
+                    side_effect=[38.0, 62.0, 50.0],
                 ),
                 patch.object(process_video, "write_word_captions", return_value=90),
                 # patch.object(process_video, "render_vertical_short") as render,
@@ -1399,8 +1546,10 @@ class VideoPipelineTests(unittest.TestCase):
                 )
 
         # self.assertEqual(result["duration_seconds"], 35.0)
-        self.assertEqual(result["duration_seconds"], 36.0)
-        self.assertEqual(generate_script.call_args_list[0].args[3], 35.0)
+        # self.assertEqual(result["duration_seconds"], 36.0)
+        self.assertEqual(result["duration_seconds"], 50.0)
+        # self.assertEqual(generate_script.call_args_list[0].args[3], 35.0)
+        self.assertEqual(generate_script.call_args_list[0].args[3], 50.0)
         # self.assertEqual(generate_script.call_args_list[1].args[3], 40.0)
         self.assertEqual(generate_script.call_count, 3)
         self.assertIn("sotto il minimo", generate_script.call_args_list[1].kwargs["duration_feedback"])
@@ -1409,12 +1558,13 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(synthesize.call_count, 3)
         self.assertEqual(synthesize.call_args.args[1].suffix, ".wav")
         self.assertEqual(synthesize.call_args.args[2], "it")
-        # The third attempt is closest to the 35-second target and is rendered.
+        # # The third attempt is closest to the 35-second target and is rendered.
+        # The third attempt matches the 50-second target and is rendered.
         self.assertEqual(rendered_narration, [scripts[2].encode("utf-8")])
         rendered_clips = render.call_args.args[4]
         self.assertAlmostEqual(
             sum(clip.end - clip.start for clip in rendered_clips),
-            36.0,
+            50.0,
         )
         # self.assertTrue(all(clip.end <= 8.0 for clip in rendered_clips))
         # self.assertTrue(all(clip.start >= 8.0 and clip.end <= 32.0 for clip in rendered_clips))

@@ -32,9 +32,12 @@ DOWNLOAD_ROOT = (PROJECT_ROOT / "downloads").resolve()
 OUTPUT_ROOT = DOWNLOAD_ROOT / "processed"
 ALLOWED_EXTENSIONS = {".mp4", ".mkv", ".webm", ".mov", ".m4v"}
 ALLOWED_LANGUAGES = {"de", "en", "es", "fr", "it", "pt"}
-NARRATION_TARGET_SECONDS = 35.0
-NARRATION_MIN_SECONDS = 30.0
-NARRATION_MAX_SECONDS = 40.0
+# NARRATION_TARGET_SECONDS = 35.0
+# NARRATION_MIN_SECONDS = 30.0
+# NARRATION_MAX_SECONDS = 40.0
+NARRATION_TARGET_SECONDS = 50.0
+NARRATION_MIN_SECONDS = 40.0
+NARRATION_MAX_SECONDS = 60.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -327,7 +330,8 @@ def run_pipeline(
                 f"{difference_from_center:.1f}s {direction} il target centrale di "
                 f"{NARRATION_TARGET_SECONDS:.0f}s (range {NARRATION_MIN_SECONDS:.0f}-"
                 f"{NARRATION_MAX_SECONDS:.0f}s). Modifica leggermente la lunghezza "
-                "per avvicinarti a 35s senza uscire dal range."
+                # "per avvicinarti a 35s senza uscire dal range."
+                f"per avvicinarti a {NARRATION_TARGET_SECONDS:.0f}s senza uscire dal range."
             )
         report_progress(
             "story_generation",

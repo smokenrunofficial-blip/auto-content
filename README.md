@@ -34,6 +34,8 @@ Prima del montaggio, ogni finestra candidata viene ricontrollata da Qwen con fot
 
 La voce è normalizzata a -16 LUFS sia con sia senza musica; il sottofondo resta al 10% e sfuma nell'ultimo secondo.
 
+Il crop 9:16 usa Haar cascade di OpenCV per seguire i volti con smoothing tra i fotogrammi e i tagli; se OpenCV o il rilevamento non sono disponibili, mantiene un'inquadratura centrata senza interrompere il render. La velocità di Piper è configurabile con `PIPER_LENGTH_SCALE` (predefinito `1.18`, valori più alti rallentano la voce). La narrazione punta a 50 secondi, entro 40-60 secondi, e chiede a `llama3.1` una storia horror originale di 90-125 parole, con inizio, tensione crescente e finale d'effetto.
+
 <!-- Le risposte Qwen vengono lette da `message.content` dell'API `/api/chat`; il parser accetta anche JSON recintato in Markdown, array di momenti e nomi alternativi per descrizioni e fotogrammi. I campi mancanti ricevono fallback conservativi (`has_text=true`, `is_animated=false`); risposte non conformi producono un avviso con un breve estratto e continuano se resta una descrizione utilizzabile. Solo una risposta vuota o priva di contenuto visivo utilizzabile blocca l'analisi. -->
 
 Per `/api/chat`, Qwen riceve uno schema JSON che richiede `scene_summary`, `actions`, `moments` e i relativi campi. Se il modello non lo rispetta, il parser accetta fence Markdown, array e alias; registra l'estratto grezzo della risposta. I fallback inferiscono “nessun testo” o “animato” solo quando la descrizione lo afferma chiaramente; in assenza di prove restano conservativi. Solo una risposta vuota o priva di contenuto visivo utilizzabile blocca l'analisi.
