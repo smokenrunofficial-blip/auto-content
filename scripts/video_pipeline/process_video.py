@@ -23,7 +23,7 @@ from .visual_analysis import (
     choose_retention_clips,
     generate_storytelling_script,
     _content_time_bounds,
-    verify_retention_samples,
+    # verify_retention_samples,
 )
 
 
@@ -124,14 +124,16 @@ def run_pipeline(
     # retention_samples = motion_samples + list(scene.moments)
     # retention_samples = list(scene.moments) if scene.moments else motion_samples
     # retention_samples = list(scene.moments)
-    retention_samples = verify_retention_samples(
-        source_path,
-        list(scene.moments),
-        motion_samples,
-        source_duration,
-        brief=brief,
-        content_bounds=(content_start, content_end),
-    )
+    # retention_samples = verify_retention_samples(
+    #     source_path,
+    #     list(scene.moments),
+    #     motion_samples,
+    #     source_duration,
+    #     brief=brief,
+    #     content_bounds=(content_start, content_end),
+    # )
+    retention_samples = motion_samples
+    clip_seconds = min(6.0, max(3.0, NARRATION_TARGET_SECONDS / 7))
     # initial_clips = choose_retention_clips(
     #     retention_samples,
     #     source_duration,
@@ -141,7 +143,9 @@ def run_pipeline(
         retention_samples,
         source_duration,
         NARRATION_TARGET_SECONDS,
+        clip_seconds=clip_seconds,
         content_bounds=(content_start, content_end),
+        temporal_only=True,
     )
     for index, clip in enumerate(initial_clips, start=1):
         report_progress(
@@ -155,14 +159,15 @@ def run_pipeline(
     #     (clip.start, clip.end)
     #     for clip in initial_clips
     # }
-    unique_clean_clip_starts = {
-        round(clip.start, 3)
-        for clip in initial_clips
-    }
-    if len(unique_clean_clip_starts) < 2:
-        diagnostic_window = min(6.0, content_end - content_start)
+    # unique_clean_clip_starts = {
+    #     round(clip.start, 3)
+    #     for clip in initial_clips
+    # }
+    # if len(unique_clean_clip_starts) < 2:
+    if not initial_clips:
+        diagnostic_window = min(clip_seconds, content_end - content_start)
         diagnostic_rows: list[str] = []
-        for sample in retention_samples:
+        for sample in scene.moments:
             segment_start = max(
                 content_start,
                 min(
@@ -191,8 +196,7 @@ def run_pipeline(
         #     "ne servono almeno 2."
         # )
         raise CandidateRejectedError(
-            f"Il video contiene {len(unique_clean_clip_starts)} segmenti animati "
-            "verificati e senza testo; ne servono almeno 2. "
+            "Non è stato possibile estrarre clip dalla parte centrale del video. "
             f"Segmenti analizzati: {segment_summary}."
         )
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
@@ -362,7 +366,14 @@ def run_pipeline(
     report_progress("narration_transcription", 72, 100, f"Timestamp ottenuti per {word_count} parole.")
 
     # clips = choose_retention_clips(retention_samples, source_duration, duration)
-    clips = choose_retention_clips(retention_samples, source_duration, duration)
+    clips = choose_retention_clips(
+        retention_samples,
+        source_duration,
+        duration,
+        clip_seconds=min(6.0, max(3.0, duration / 7)),
+        content_bounds=(content_start, content_end),
+        temporal_only=True,
+    )
     report_progress("rendering", 75, 0, "Montaggio 9:16, tagli di retention e sottotitoli.")
     output_path = output_directory / "final.mp4"
     render_vertical_short(

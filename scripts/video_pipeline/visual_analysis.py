@@ -39,6 +39,8 @@ NARRATION_MAX_WORDS = 115
 MIN_RETENTION_SUITABILITY_SCORE = 0.35
 RETENTION_EDGE_EXCLUSION_SECONDS = 8.0
 CONTENT_EDGE_EXCLUSION_SECONDS = 5.0
+# CONTENT_EDGE_EXCLUSION_SECONDS = 5.0
+MAX_CONTENT_EDGE_EXCLUSION_SECONDS = 60.0
 MIN_CLIP_MOTION_SCORE = 0.003
 MIN_CLIP_MOTION_SAMPLES = 2
 BLACK_FRAME_MAX_MEAN = 4.0
@@ -153,12 +155,14 @@ def _description_signals_visible_text(description: str) -> bool:
 
 
 def _content_time_bounds(duration: float) -> tuple[float, float]:
-    content_end = (
-        duration - CONTENT_EDGE_EXCLUSION_SECONDS
-        if duration > 15.0
-        else duration
-    )
-    return CONTENT_EDGE_EXCLUSION_SECONDS, content_end
+    # content_end = (
+    #     duration - CONTENT_EDGE_EXCLUSION_SECONDS
+    #     if duration > 15.0
+    #     else duration
+    # )
+    # return CONTENT_EDGE_EXCLUSION_SECONDS, content_end
+    edge_exclusion = min(MAX_CONTENT_EDGE_EXCLUSION_SECONDS, duration * 0.25)
+    return edge_exclusion, duration - edge_exclusion
 
 
 def _bounded_content_time_bounds(
@@ -357,6 +361,7 @@ def choose_retention_clips(
     target_duration: float,
     clip_seconds: float = 6.0,
     content_bounds: tuple[float, float] | None = None,
+    temporal_only: bool = False,
 ) -> list[Clip]:
     if video_duration <= 0 or target_duration <= 0:
         raise ValueError("La durata della narrazione e del video deve essere positiva.")
@@ -380,25 +385,51 @@ def choose_retention_clips(
         )
         for sample in samples
     ]
-    safe_samples = [
-        sample
-        for sample in ranked_samples
-        if (
-            sample.suitable
-            and _moment_is_safe_for_retention(sample)
-            and content_start <= sample.timestamp <= content_end
-        )
-    ]
-    rejected_samples = [
-        sample
-        for sample in ranked_samples
-        if (
-            sample not in safe_samples
-            and content_start <= sample.timestamp <= content_end
-        )
-    ]
-    # Il fallback estetico usa solo momenti già verificati come animati e privi di testo.
-    ranked_samples = safe_samples
+    # safe_samples = [
+    #     sample
+    #     for sample in ranked_samples
+    #     if (
+    #         sample.suitable
+    #         and _moment_is_safe_for_retention(sample)
+    #         and content_start <= sample.timestamp <= content_end
+    #     )
+    # ]
+    # rejected_samples = [
+    #     sample
+    #     for sample in ranked_samples
+    #     if (
+    #         sample not in safe_samples
+    #         and content_start <= sample.timestamp <= content_end
+    #     )
+    # ]
+    if temporal_only:
+        ranked_samples = [
+            sample
+            for sample in ranked_samples
+            if content_start <= sample.timestamp <= content_end
+        ]
+        rejected_samples: list[VisualMoment] = []
+    else:
+        safe_samples = [
+            sample
+            for sample in ranked_samples
+            if (
+                sample.suitable
+                and _moment_is_safe_for_retention(sample)
+                and content_start <= sample.timestamp <= content_end
+            )
+        ]
+        rejected_samples = [
+            sample
+            for sample in ranked_samples
+            if (
+                sample not in safe_samples
+                and content_start <= sample.timestamp <= content_end
+            )
+        ]
+        ranked_samples = safe_samples
+    # # Il fallback estetico usa solo momenti già verificati come animati e privi di testo.
+    # In modalità temporale i limiti temporali sostituiscono quei filtri.
     if not ranked_samples:
         return []
 
@@ -410,21 +441,38 @@ def choose_retention_clips(
         )
         return Clip(start, start + window, sample.score, sample.focus_x)
 
-    interior_samples = [
-        sample
-        for sample in ranked_samples
-        if clip_for_sample(sample).start >= RETENTION_EDGE_EXCLUSION_SECONDS
-        and clip_for_sample(sample).end
-        <= video_duration - RETENTION_EDGE_EXCLUSION_SECONDS
-    ]
-    if interior_samples:
-        ranked_samples = interior_samples
-    preferred_samples = [
-        sample
-        for sample in ranked_samples
-        if sample.score >= MIN_RETENTION_SUITABILITY_SCORE
-    ]
-    ranked_samples = preferred_samples or ranked_samples
+    # interior_samples = [
+    #     sample
+    #     for sample in ranked_samples
+    #     if clip_for_sample(sample).start >= RETENTION_EDGE_EXCLUSION_SECONDS
+    #     and clip_for_sample(sample).end
+    #     <= video_duration - RETENTION_EDGE_EXCLUSION_SECONDS
+    # ]
+    # if interior_samples:
+    #     ranked_samples = interior_samples
+    if not temporal_only:
+        interior_samples = [
+            sample
+            for sample in ranked_samples
+            if clip_for_sample(sample).start >= RETENTION_EDGE_EXCLUSION_SECONDS
+            and clip_for_sample(sample).end
+            <= video_duration - RETENTION_EDGE_EXCLUSION_SECONDS
+        ]
+        if interior_samples:
+            ranked_samples = interior_samples
+    # preferred_samples = [
+    #     sample
+    #     for sample in ranked_samples
+    #     if sample.score >= MIN_RETENTION_SUITABILITY_SCORE
+    # ]
+    # ranked_samples = preferred_samples or ranked_samples
+    if not temporal_only:
+        preferred_samples = [
+            sample
+            for sample in ranked_samples
+            if sample.score >= MIN_RETENTION_SUITABILITY_SCORE
+        ]
+        ranked_samples = preferred_samples or ranked_samples
 
     rejected_windows = [
         (

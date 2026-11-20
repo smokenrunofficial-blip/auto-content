@@ -102,7 +102,8 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertFalse(verified[0].suitable)
 
-    def test_pipeline_rejects_repeated_copies_of_one_clean_clip(self) -> None:
+    # def test_pipeline_rejects_repeated_copies_of_one_clean_clip(self) -> None:
+    def test_pipeline_bypasses_vision_gate_when_no_temporal_clip_exists(self) -> None:
         scene = SceneAnalysis(
             "Anime senza testo.",
             (),
@@ -117,16 +118,17 @@ class VideoPipelineTests(unittest.TestCase):
                 ),
                 patch.object(process_video, "analyze_video", return_value=(40.0, [], 0.5)),
                 patch.object(process_video, "analyze_keyframes", return_value=scene),
-                patch.object(
-                    process_video,
-                    "verify_retention_samples",
-                    return_value=list(scene.moments),
-                ),
+                # patch.object(
+                #     process_video,
+                #     "verify_retention_samples",
+                #     return_value=list(scene.moments),
+                # ),
                 patch.object(
                     process_video,
                     "choose_retention_clips",
-                    return_value=[Clip(12.0, 18.0, 0.9), Clip(12.0, 17.0, 0.9)],
-                ),
+                    # return_value=[Clip(12.0, 18.0, 0.9), Clip(12.0, 17.0, 0.9)],
+                    return_value=[],
+                ) as choose_clips,
                 patch.object(process_video, "OUTPUT_ROOT", Path(temporary)),
                 patch.object(process_video, "load_whisper_model") as load_whisper_model,
             ):
@@ -140,8 +142,11 @@ class VideoPipelineTests(unittest.TestCase):
                         True,
                     )
 
-        self.assertIn("[12.0s-18.0s]", str(rejected.exception))
-        self.assertIn("animated=True, has_text=False, score=0.90", str(rejected.exception))
+        # self.assertIn("[12.0s-18.0s]", str(rejected.exception))
+        # self.assertIn("animated=True, has_text=False, score=0.90", str(rejected.exception))
+        self.assertIn("parte centrale del video", str(rejected.exception))
+        self.assertTrue(choose_clips.call_args.kwargs["temporal_only"])
+        self.assertEqual(choose_clips.call_args.args[0], [])
         load_whisper_model.assert_not_called()
 
     def test_clip_verification_accepts_animated_text_free_frames(self) -> None:
@@ -278,8 +283,48 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertAlmostEqual(sum(clip.end - clip.start for clip in clips), 10.0)
         # self.assertTrue(all(0 <= clip.start < clip.end <= 4.0 for clip in clips))
-        self.assertTrue(all(5.0 <= clip.start < clip.end <= 10.0 for clip in clips))
+        # self.assertTrue(all(5.0 <= clip.start < clip.end <= 10.0 for clip in clips))
+        self.assertTrue(all(2.5 <= clip.start < clip.end <= 7.5 for clip in clips))
         self.assertGreater(len(clips), 1)
+
+    def test_temporal_clip_selection_ignores_text_and_animation_flags(self) -> None:
+        sample = VisualMoment(
+            60.0,
+            0.1,
+            0.5,
+            suitable=False,
+            description="A central title over an animation.",
+            has_text=True,
+            is_animated=False,
+        )
+
+        clips = choose_retention_clips(
+            [sample],
+            video_duration=120.0,
+            target_duration=5.0,
+            clip_seconds=5.0,
+            temporal_only=True,
+        )
+
+        self.assertEqual(len(clips), 1)
+        self.assertEqual((clips[0].start, clips[0].end), (57.5, 62.5))
+
+    def test_temporal_clip_selection_keeps_the_entire_adaptive_center(self) -> None:
+        clips = choose_retention_clips(
+            [
+                _animated_moment(5.0, 0.1),
+                _animated_moment(10.0, 0.1),
+            ],
+            video_duration=20.0,
+            target_duration=6.0,
+            clip_seconds=3.0,
+            temporal_only=True,
+        )
+
+        self.assertEqual(
+            [(clip.start, clip.end) for clip in clips],
+            [(5.0, 8.0), (8.5, 11.5)],
+        )
 
     def test_render_uses_narration_duration_for_repeated_clips(self) -> None:
         clips = [Clip(0.0, 4.0, 0.0), Clip(0.0, 4.0, 0.0), Clip(0.0, 2.0, 0.0)]
@@ -436,7 +481,8 @@ class VideoPipelineTests(unittest.TestCase):
         clips = choose_retention_clips(
             [
                 # _animated_moment(3.0, 0.8),
-                _animated_moment(10.0, 0.8),
+                # _animated_moment(10.0, 0.8),
+                _animated_moment(15.0, 0.8),
                 _animated_moment(24.0, 0.99, suitable=False),
             ],
             video_duration=48.0,
@@ -511,7 +557,8 @@ class VideoPipelineTests(unittest.TestCase):
 
         self.assertEqual(clips[0].start, 12.0)
 
-    def test_retention_excludes_first_and_last_five_seconds(self) -> None:
+    # def test_retention_excludes_first_and_last_five_seconds(self) -> None:
+    def test_retention_excludes_adaptive_quarter_at_both_ends(self) -> None:
         clips = choose_retention_clips(
             [
                 _animated_moment(3.0, 0.99),
@@ -523,12 +570,19 @@ class VideoPipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(len(clips), 1)
-        self.assertGreaterEqual(clips[0].start, 5.0)
-        self.assertLessEqual(clips[0].end, 35.0)
+        # self.assertGreaterEqual(clips[0].start, 5.0)
+        # self.assertLessEqual(clips[0].end, 35.0)
+        self.assertGreaterEqual(clips[0].start, 10.0)
+        self.assertLessEqual(clips[0].end, 30.0)
 
-    def test_content_bounds_exclude_outro_only_after_fifteen_seconds(self) -> None:
-        self.assertEqual(visual_analysis._content_time_bounds(15.0), (5.0, 15.0))
-        self.assertEqual(visual_analysis._content_time_bounds(16.0), (5.0, 11.0))
+    # def test_content_bounds_exclude_outro_only_after_fifteen_seconds(self) -> None:
+    def test_content_bounds_adapt_exclusions_to_video_duration(self) -> None:
+        # self.assertEqual(visual_analysis._content_time_bounds(15.0), (5.0, 15.0))
+        # self.assertEqual(visual_analysis._content_time_bounds(16.0), (5.0, 11.0))
+        self.assertEqual(visual_analysis._content_time_bounds(15.0), (3.75, 11.25))
+        self.assertEqual(visual_analysis._content_time_bounds(16.0), (4.0, 12.0))
+        self.assertEqual(visual_analysis._content_time_bounds(120.0), (30.0, 90.0))
+        self.assertEqual(visual_analysis._content_time_bounds(240.0), (60.0, 180.0))
 
     def test_verification_frames_are_sampled_within_the_segment(self) -> None:
         frame_times = visual_analysis._verification_frame_times(10.0, 16.0)
@@ -1244,7 +1298,7 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(truncated.split()[-1], "parola114.")
 
     # def test_pipeline_retries_for_target_audio_and_repeats_short_source(self) -> None:
-    def test_pipeline_retries_for_target_audio_using_only_safe_animation(self) -> None:
+    def test_pipeline_retries_for_target_audio_with_temporal_animation_cuts(self) -> None:
         scripts = [
             " ".join(f"tentativo{attempt}_parola{index}" for index in range(90))
             for attempt in range(1, 4)
@@ -1287,13 +1341,22 @@ class VideoPipelineTests(unittest.TestCase):
                     return_value=project_root / "source.mp4",
                 ),
                 # patch.object(process_video, "analyze_video", return_value=(8.0, [], 0.5)),
-                patch.object(process_video, "analyze_video", return_value=(40.0, [], 0.5)),
-                patch.object(process_video, "analyze_keyframes", return_value=scene),
+                # patch.object(process_video, "analyze_video", return_value=(40.0, [], 0.5)),
                 patch.object(
                     process_video,
-                    "verify_retention_samples",
-                    return_value=list(scene.moments),
+                    "analyze_video",
+                    return_value=(
+                        40.0,
+                        [_animated_moment(15.0, 0.9), _animated_moment(28.0, 0.8)],
+                        0.5,
+                    ),
                 ),
+                patch.object(process_video, "analyze_keyframes", return_value=scene),
+                # patch.object(
+                #     process_video,
+                #     "verify_retention_samples",
+                #     return_value=list(scene.moments),
+                # ),
                 patch.object(process_video, "load_whisper_model", return_value=object()),
                 patch.object(
                     process_video,
@@ -1354,7 +1417,8 @@ class VideoPipelineTests(unittest.TestCase):
             36.0,
         )
         # self.assertTrue(all(clip.end <= 8.0 for clip in rendered_clips))
-        self.assertTrue(all(clip.start >= 8.0 and clip.end <= 32.0 for clip in rendered_clips))
+        # self.assertTrue(all(clip.start >= 8.0 and clip.end <= 32.0 for clip in rendered_clips))
+        self.assertTrue(all(clip.start >= 10.0 and clip.end <= 30.0 for clip in rendered_clips))
 
     def test_pipeline_reports_candidate_rejection_for_sequential_retry(self) -> None:
         output = io.StringIO()
