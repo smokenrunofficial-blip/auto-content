@@ -112,6 +112,24 @@ class SpeechTests(unittest.TestCase):
 #         self.assertEqual(stdout.getvalue(), "")
 #
 #
+    def test_release_whisper_model_moves_cuda_weights_to_cpu(self) -> None:
+        class FakeModel:
+            device = "cuda:0"
+
+            def __init__(self) -> None:
+                self.moves: list[str] = []
+
+            def to(self, device: str) -> None:
+                self.moves.append(device)
+
+        model = FakeModel()
+        with patch.object(speech, "_clear_cuda_memory", return_value=True) as clear_cache:
+            original_device = speech.release_whisper_model(model)
+
+        self.assertEqual(original_device, "cuda:0")
+        self.assertEqual(model.moves, ["cpu"])
+        clear_cache.assert_called_once_with()
+
     def test_synthesis_posts_to_local_server_and_writes_wav(self) -> None:
         audio = b"RIFF\x04\x00\x00\x00WAVE"
         response = io.BytesIO(audio)

@@ -1,4 +1,6 @@
 import json
+import gc
+import logging
 import os
 import sys
 from contextlib import redirect_stdout
@@ -12,7 +14,64 @@ from .events import report_progress
 
 
 # ELEVENLABS_REQUEST_TIMEOUT_SECONDS = 120
-LOCAL_TTS_TIMEOUT_SECONDS = 120
+# LOCAL_TTS_TIMEOUT_SECONDS = 120
+LOCAL_TTS_TIMEOUT_SECONDS = 600
+LOGGER = logging.getLogger(__name__)
+
+
+def _clear_cuda_memory() -> bool:
+    try:
+        import torch
+    except ImportError:
+        return False
+    if not torch.cuda.is_available():
+        return False
+
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    LOGGER.info("Memoria cache CUDA di Whisper rilasciata.")
+    return True
+
+
+def release_whisper_model(model: Any) -> str:
+    original_device = str(getattr(model, "device", "cpu"))
+    if not original_device.startswith("cuda"):
+        LOGGER.warning(
+            "VRAM: Whisper usa %s; non è necessario liberare memoria GPU.",
+            original_device,
+        )
+        return original_device
+
+    model.to("cpu")
+    _clear_cuda_memory()
+    LOGGER.warning("VRAM: Whisper spostato su CPU prima della sintesi TTS.")
+    return original_device
+
+
+def restore_whisper_model(model: Any, device: str) -> str:
+    if not device.startswith("cuda"):
+        return device
+    try:
+        import torch
+    except ImportError:
+        LOGGER.warning("PyTorch non è disponibile; Whisper resta su CPU.")
+        return "cpu"
+    if not torch.cuda.is_available():
+        LOGGER.warning("CUDA non è disponibile; Whisper resta su CPU.")
+        return "cpu"
+
+    try:
+        model.to(device)
+    except RuntimeError as error:
+        if "out of memory" not in str(error).casefold():
+            raise
+        model.to("cpu")
+        _clear_cuda_memory()
+        LOGGER.warning("VRAM insufficiente per Whisper; il modello resta su CPU.")
+        return "cpu"
+    LOGGER.warning("VRAM: Whisper ripristinato su %s.", device)
+    return device
 
 
 def _report_synthesis_progress(stage_progress: int, message: str) -> None:

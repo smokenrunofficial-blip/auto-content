@@ -1,4 +1,6 @@
 # import os
+import difflib
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,9 @@ CAPTION_MARGIN_R = 125
 CAPTION_MARGIN_V = 640
 CAPTION_MAX_LINE_CHARACTERS = 20
 CAPTION_MAX_EVENT_CHARACTERS = CAPTION_MAX_LINE_CHARACTERS * 2
+CAPTION_MAX_WORDS_PER_EVENT = 3
+CAPTION_EARLY_OFFSET_SECONDS = 0.05
+CAPTION_MIN_EVENT_DURATION_SECONDS = 0.01
 CAPTION_FONT_DIRECTORY = Path(__file__).resolve().parents[2] / "backend" / "tts" / "fonts"
 CAPTION_KEYWORDS = {
     "buio", "sangue", "ombra", "ombre", "morte", "morto", "morta", "urlo", "urla",
@@ -117,6 +122,129 @@ def _escape_ass_text(text: str) -> str:
     return text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
 
 
+def _normalize_alignment_word(word: str) -> str:
+    return "".join(character.casefold() for character in word if character.isalnum())
+
+
+def align_transcription_to_script(
+    transcription: dict[str, Any],
+    script_text: str,
+) -> list[dict[str, Any]]:
+    script_words = re.findall(r"\S+", script_text.strip())
+    if not script_words:
+        raise ValueError("Lo script della narrazione non contiene parole da sottotitolare.")
+
+    spoken_words = [
+        {
+            "word": str(word["word"]).strip(),
+            "start": float(word["start"]),
+            "end": float(word["end"]),
+        }
+        for segment in transcription.get("segments", [])
+        for word in segment.get("words", [])
+        if word.get("word")
+        and math.isfinite(float(word.get("start", 0)))
+        and math.isfinite(float(word.get("end", 0)))
+        and float(word.get("end", 0)) > float(word.get("start", 0))
+    ]
+    spoken_words = [
+        word for word in spoken_words if _normalize_alignment_word(word["word"])
+    ]
+    if not spoken_words:
+        raise RuntimeError("Whisper non ha prodotto timestamp validi per le parole.")
+
+    aligned: list[dict[str, Any] | None] = [None] * len(script_words)
+    matcher = difflib.SequenceMatcher(
+        a=[_normalize_alignment_word(word["word"]) for word in spoken_words],
+        b=[_normalize_alignment_word(word) for word in script_words],
+        autojunk=False,
+    )
+    for (
+        operation,
+        spoken_start,
+        spoken_end,
+        script_start,
+        script_end,
+    ) in matcher.get_opcodes():
+        if operation == "equal":
+            for offset in range(script_end - script_start):
+                source_word = spoken_words[spoken_start + offset]
+                aligned[script_start + offset] = {
+                    "word": script_words[script_start + offset],
+                    "start": source_word["start"],
+                    "end": source_word["end"],
+                }
+        elif operation == "replace" and spoken_start < spoken_end:
+            source_words = spoken_words[spoken_start:spoken_end]
+            target_count = script_end - script_start
+            if target_count <= 0:
+                continue
+            if len(source_words) == target_count:
+                for offset, source_word in enumerate(source_words):
+                    aligned[script_start + offset] = {
+                        "word": script_words[script_start + offset],
+                        "start": source_word["start"],
+                        "end": source_word["end"],
+                    }
+            else:
+                span_start = source_words[0]["start"]
+                span_end = source_words[-1]["end"]
+                step = max(0.0, span_end - span_start) / target_count
+                for offset in range(target_count):
+                    aligned[script_start + offset] = {
+                        "word": script_words[script_start + offset],
+                        "start": span_start + step * offset,
+                        "end": span_start + step * (offset + 1),
+                    }
+
+    missing_index = 0
+    average_spoken_duration = sum(
+        word["end"] - word["start"] for word in spoken_words
+    ) / len(spoken_words)
+    while missing_index < len(aligned):
+        if aligned[missing_index] is not None:
+            missing_index += 1
+            continue
+        missing_end = missing_index
+        while missing_end < len(aligned) and aligned[missing_end] is None:
+            missing_end += 1
+        missing_count = missing_end - missing_index
+        previous_word = aligned[missing_index - 1] if missing_index > 0 else None
+        next_word = aligned[missing_end] if missing_end < len(aligned) else None
+        span_start = (
+            float(previous_word["end"])
+            if previous_word is not None
+            else spoken_words[0]["start"]
+        )
+        span_end = (
+            float(next_word["start"])
+            if next_word is not None
+            else spoken_words[-1]["end"]
+        )
+        if span_end <= span_start:
+            span_end = span_start + average_spoken_duration * missing_count
+        step = (span_end - span_start) / missing_count
+        for offset in range(missing_count):
+            script_index = missing_index + offset
+            aligned[script_index] = {
+                "word": script_words[script_index],
+                "start": span_start + step * offset,
+                "end": span_start + step * (offset + 1),
+            }
+        missing_index = missing_end
+
+    result: list[dict[str, Any]] = []
+    previous_end = 0.0
+    for word in aligned:
+        if word is None:
+            raise RuntimeError("Impossibile allineare tutte le parole dello script.")
+        start = max(previous_end, 0.0, float(word["start"]))
+        end = max(start + CAPTION_MIN_EVENT_DURATION_SECONDS, float(word["end"]))
+        result.append({"word": word["word"], "start": start, "end": end})
+        previous_end = end
+    return result
+
+
 # def _wrap_caption_words(words: list[str], active_index: int) -> str:
 #     lines: list[str] = []
 #     current_line: list[str] = []
@@ -187,7 +315,8 @@ def _wrap_caption_words(
     highlighted_indices = highlighted_indices or set()
 
     for index, raw_word in enumerate(words):
-        plain_word = raw_word.strip().lower()
+        # plain_word = raw_word.strip().lower()
+        plain_word = raw_word.strip()
         if not plain_word:
             continue
         visible_length = len(plain_word)
@@ -198,7 +327,8 @@ def _wrap_caption_words(
             # word = rf"{{\fn{_escape_ass_text(font_name)}\b1}}{word}{{\r}}"
             word = (
                 rf"{{\fn{_escape_ass_text(font_name)}\b1}}"
-                f"{_escape_ass_text(plain_word.upper())}{{\\r}}"
+                # f"{_escape_ass_text(plain_word.upper())}{{\\r}}"
+                f"{_escape_ass_text(plain_word)}{{\\r}}"
             )
 
         additional_characters = visible_length + (1 if current_line else 0)
@@ -234,8 +364,11 @@ def _caption_word_groups(words: list[dict[str, Any]]) -> list[list[dict[str, Any
             str(item["word"]).strip() for item in current_group
         ] + [text]
         candidate_caption = _wrap_caption_words(candidate_texts)
+        # len(" ".join(candidate_texts)) > CAPTION_MAX_EVENT_CHARACTERS
         if current_group and (
-            len(" ".join(candidate_texts)) > CAPTION_MAX_EVENT_CHARACTERS
+            # len(current_group) >= CAPTION_MAX_WORDS_PER_EVENT
+            len(current_group) >= CAPTION_MAX_WORDS_PER_EVENT
+            or len(" ".join(candidate_texts)) > CAPTION_MAX_EVENT_CHARACTERS
             or candidate_caption.count(r"\N") >= 2
             or str(current_group[-1]["word"]).strip().endswith(sentence_endings)
         ):
@@ -252,13 +385,55 @@ def _caption_word_groups(words: list[dict[str, Any]]) -> list[list[dict[str, Any
     return groups
 
 
-def write_word_captions(transcription: dict[str, Any], destination: Path) -> int:
-    words = [
-        word
-        for segment in transcription.get("segments", [])
-        for word in segment.get("words", [])
-        if word.get("word") and float(word.get("end", 0)) > float(word.get("start", 0))
-    ]
+def _caption_event_times(
+    groups: list[list[dict[str, Any]]],
+) -> list[tuple[float, float]]:
+    event_times: list[tuple[float, float]] = []
+    previous_end = 0.0
+    for index, group in enumerate(groups):
+        start = max(
+            previous_end,
+            0.0,
+            float(group[0]["start"]) - CAPTION_EARLY_OFFSET_SECONDS,
+        )
+        end = max(
+            start + CAPTION_MIN_EVENT_DURATION_SECONDS,
+            float(group[-1]["end"]),
+        )
+        if index + 1 < len(groups):
+            next_start = max(
+                0.0,
+                float(groups[index + 1][0]["start"])
+                - CAPTION_EARLY_OFFSET_SECONDS,
+            )
+            end = min(end, max(start + CAPTION_MIN_EVENT_DURATION_SECONDS, next_start))
+        event_times.append((start, end))
+        previous_end = end
+    return event_times
+
+
+# def write_word_captions(transcription: dict[str, Any], destination: Path) -> int:
+#     words = [
+#         word
+#         for segment in transcription.get("segments", [])
+#         for word in segment.get("words", [])
+#         if word.get("word") and float(word.get("end", 0)) > float(word.get("start", 0))
+#     ]
+def write_word_captions(
+    transcription: dict[str, Any],
+    destination: Path,
+    script_text: str | None = None,
+) -> int:
+    if script_text is None:
+        words = [
+            word
+            for segment in transcription.get("segments", [])
+            for word in segment.get("words", [])
+            if word.get("word")
+            and float(word.get("end", 0)) > float(word.get("start", 0))
+        ]
+    else:
+        words = align_transcription_to_script(transcription, script_text)
     if not words:
         raise RuntimeError("Whisper non ha prodotto timestamp per le parole della narrazione.")
 
@@ -324,10 +499,14 @@ def write_word_captions(transcription: dict[str, Any], destination: Path) -> int
     #     caption_words = [str(word["word"]).strip() for word in group]
     #     text = _wrap_caption_words(caption_words)
     caption_groups = _caption_word_groups(words)
+    event_times = _caption_event_times(caption_groups)
     font_names = _caption_font_names()
     keyword_fonts = font_names[1:] or font_names[:1]
     next_keyword_index = 0
-    for index, group in enumerate(caption_groups):
+    # for index, group in enumerate(caption_groups):
+    for index, (group, (start, end)) in enumerate(
+        zip(caption_groups, event_times)
+    ):
         caption_words = [str(word["word"]).strip() for word in group]
         keyword_indices = _caption_keyword_indices(caption_words)
         text = _wrap_caption_words(
@@ -337,11 +516,11 @@ def write_word_captions(transcription: dict[str, Any], destination: Path) -> int
             keyword_offset=next_keyword_index,
         )
         next_keyword_index += len(keyword_indices)
-        start = float(group[0]["start"])
-        end = float(group[-1]["end"])
-        if index + 1 < len(caption_groups):
-            next_start = float(caption_groups[index + 1][0]["start"])
-            end = max(end, next_start)
+        # start = float(group[0]["start"])
+        # end = float(group[-1]["end"])
+        # if index + 1 < len(caption_groups):
+        #     next_start = float(caption_groups[index + 1][0]["start"])
+        #     end = max(end, next_start)
         lines.append(
             f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,"
             f"{CAPTION_MARGIN_L},{CAPTION_MARGIN_R},{CAPTION_MARGIN_V},,{text}"

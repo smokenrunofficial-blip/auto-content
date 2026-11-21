@@ -14,6 +14,8 @@ from .events import report_progress
 from .render import audio_duration, render_vertical_short
 from .speech import (
     load_whisper_model,
+    release_whisper_model,
+    restore_whisper_model,
     synthesize_narration,
     transcribe,
 )
@@ -216,6 +218,7 @@ def run_pipeline(
     report_progress("source_transcription", 20, 0, "Trascrizione della sorgente con Whisper.")
     model = load_whisper_model()
     source_transcription = transcribe(model, source_path, language, word_timestamps=False)
+    whisper_device = release_whisper_model(model)
     report_progress("source_transcription", 38, 100, "Trascrizione sorgente completata.")
 
     # target_duration = min(source_duration * 0.9, 30.0)
@@ -358,15 +361,22 @@ def run_pipeline(
     # report_progress("elevenlabs_synthesis", 60, 100, "Traccia narrata generata.")
     report_progress("elevenlabs_synthesis", 60, 100, "Voce narrante locale generata.")
 
+    whisper_device = restore_whisper_model(model, whisper_device)
     report_progress("narration_transcription", 62, 0, "Whisper allinea le parole della narrazione.")
     narration_transcription = transcribe(
         model,
         narration_path,
-        language,
+        # language,
+        "it",
         word_timestamps=True,
     )
     captions_path = output_directory / "captions.ass"
-    word_count = write_word_captions(narration_transcription, captions_path)
+    # word_count = write_word_captions(narration_transcription, captions_path)
+    word_count = write_word_captions(
+        narration_transcription,
+        captions_path,
+        script_text=script,
+    )
     report_progress("narration_transcription", 72, 100, f"Timestamp ottenuti per {word_count} parole.")
 
     # clips = choose_retention_clips(retention_samples, source_duration, duration)

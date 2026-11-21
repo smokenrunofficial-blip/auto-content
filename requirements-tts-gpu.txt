@@ -1,0 +1,5 @@
+# Install the CUDA 12.8 PyTorch wheels first for RTX 50-series GPUs:
+# python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch>=2.7
+torchaudio>=2.7
+coqui-tts>=0.28,<0.29

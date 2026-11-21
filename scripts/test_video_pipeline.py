@@ -1506,9 +1506,20 @@ class VideoPipelineTests(unittest.TestCase):
                 patch.object(process_video, "load_whisper_model", return_value=object()),
                 patch.object(
                     process_video,
+                    "release_whisper_model",
+                    return_value="cuda:0",
+                ) as release_whisper,
+                patch.object(
+                    process_video,
+                    "restore_whisper_model",
+                    return_value="cuda:0",
+                ) as restore_whisper,
+                patch.object(
+                    process_video,
                     "transcribe",
                     side_effect=[{"segments": []}, {"segments": []}],
-                ),
+                # ),
+                ) as transcribe_mock,
                 patch.object(
                     process_video,
                     "generate_storytelling_script",
@@ -1528,7 +1539,12 @@ class VideoPipelineTests(unittest.TestCase):
                     # side_effect=[28.0, 42.0, 36.0],
                     side_effect=[38.0, 62.0, 50.0],
                 ),
-                patch.object(process_video, "write_word_captions", return_value=90),
+                patch.object(
+                    process_video,
+                    "write_word_captions",
+                    return_value=90,
+                ) as caption_writer,
+                # patch.object(process_video, "write_word_captions", return_value=90),
                 # patch.object(process_video, "render_vertical_short") as render,
                 patch.object(
                     process_video,
@@ -1558,6 +1574,14 @@ class VideoPipelineTests(unittest.TestCase):
         self.assertEqual(synthesize.call_count, 3)
         self.assertEqual(synthesize.call_args.args[1].suffix, ".wav")
         self.assertEqual(synthesize.call_args.args[2], "it")
+        release_whisper.assert_called_once()
+        restore_whisper.assert_called_once()
+        self.assertEqual(transcribe_mock.call_args_list[1].args[2], "it")
+        self.assertTrue(transcribe_mock.call_args_list[1].kwargs["word_timestamps"])
+        self.assertEqual(
+            caption_writer.call_args.kwargs["script_text"],
+            scripts[2],
+        )
         # # The third attempt is closest to the 35-second target and is rendered.
         # The third attempt matches the 50-second target and is rendered.
         self.assertEqual(rendered_narration, [scripts[2].encode("utf-8")])
@@ -1710,11 +1734,14 @@ class VideoPipelineTests(unittest.TestCase):
         ]
         self.assertEqual(len(dialogue_lines), 2)
         # self.assertIn("0:00:00.00,0:00:00.40", contents)
-        self.assertIn("0:00:00.00,0:00:01.00", dialogue_lines[0])
+        # self.assertIn("0:00:00.00,0:00:01.00", dialogue_lines[0])
+        self.assertIn("0:00:00.00,0:00:00.90", dialogue_lines[0])
         # self.assertIn("Ciao mondo.", dialogue_lines[0])
-        self.assertIn(r"la {\fnNosifer\b1}OMBRA.{\r}", dialogue_lines[0])
+        # self.assertIn(r"la {\fnNosifer\b1}OMBRA.{\r}", dialogue_lines[0])
+        self.assertIn(r"La {\fnNosifer\b1}ombra.{\r}", dialogue_lines[0])
         # self.assertIn("Nuova frase.", dialogue_lines[1])
-        self.assertIn(r"il {\fnSpecial Elite\b1}BUIO.{\r}", dialogue_lines[1])
+        # self.assertIn(r"il {\fnSpecial Elite\b1}BUIO.{\r}", dialogue_lines[1])
+        self.assertIn(r"Il {\fnSpecial Elite\b1}buio.{\r}", dialogue_lines[1])
         # self.assertIn(r"{\c&H0000FFFF&\b1}", contents)
         self.assertNotIn(r"{\c", contents)
         self.assertNotRegex(contents, r"\\(?:k|kf|ko|move|pos)")
@@ -1754,6 +1781,55 @@ class VideoPipelineTests(unittest.TestCase):
                 for line in text.split(r"\N")
             )
         )
+
+    def test_word_captions_align_script_text_with_non_overlapping_word_groups(self) -> None:
+        script = "La porta si aprì lentamente nel buio."
+        transcription = {
+            "segments": [
+                {
+                    "words": [
+                        {
+                            "word": word,
+                            "start": 1.0 + index * 0.4,
+                            "end": 1.3 + index * 0.4,
+                        }
+                        for index, word in enumerate(
+                            ["La", "porta", "si", "apre", "lentamente", "nel", "buio."]
+                        )
+                    ]
+                }
+            ]
+        }
+
+        aligned = captions.align_transcription_to_script(transcription, script)
+        groups = captions._caption_word_groups(aligned)
+        event_times = captions._caption_event_times(groups)
+
+        self.assertEqual([word["word"] for word in aligned], script.split())
+        self.assertEqual(
+            aligned[3]["start"],
+            transcription["segments"][0]["words"][3]["start"],
+        )
+        self.assertAlmostEqual(event_times[0][0], 0.95)
+        self.assertTrue(all(len(group) <= 3 for group in groups))
+        self.assertTrue(
+            all(
+                previous[1] <= following[0]
+                for previous, following in zip(event_times, event_times[1:])
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "captions.ass"
+            write_word_captions(
+                transcription,
+                destination,
+                script_text=script,
+            )
+            contents = destination.read_text(encoding="utf-8")
+        # self.assertIn("apri", contents)
+        self.assertIn("aprì", contents)
+        self.assertNotIn("apre", contents)
 
 
 if __name__ == "__main__":
