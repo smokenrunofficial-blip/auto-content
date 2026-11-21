@@ -511,6 +511,19 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertTrue(
             all(options.get("cookiefile") == str(cookie_file) for options in captured_options)
         )
+        self.assertTrue(
+            all(
+                options.get("extractor_args")
+                == {"youtube": {"player_client": ["default", "web", "android"]}}
+                for options in captured_options
+            )
+        )
+        self.assertEqual(
+            captured_options[-1]["format"],
+            youtube_downloader.YOUTUBE_FORMAT_SELECTOR,
+        )
+        self.assertEqual(captured_options[-1]["merge_output_format"], "mp4")
+        self.assertEqual(captured_options[-1]["remuxvideo"], "mp4")
 
     def test_exports_browser_cookies_to_a_private_netscape_cache(self) -> None:
         class FakeCookieJar:

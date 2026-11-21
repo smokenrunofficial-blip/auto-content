@@ -26,6 +26,10 @@ MAX_SOURCE_VIDEO_DURATION_SECONDS = 900
 IDEAL_SOURCE_VIDEO_DURATION_MIN_SECONDS = 300
 IDEAL_SOURCE_VIDEO_DURATION_MAX_SECONDS = 600
 SUPPORTED_COOKIE_BROWSERS = {"chrome", "edge", "firefox"}
+YOUTUBE_FORMAT_SELECTOR = (
+    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+)
 YOUTUBE_AUTH_REQUIRED_MESSAGE = (
     "YouTube richiede l'accesso o la conferma dell'età. "
     "Clicca su \"Login YouTube (Cache)\" e importa la sessione dal browser "
@@ -164,6 +168,12 @@ def _add_cookie_file_option(options: dict[str, Any]) -> None:
     cookie_file = youtube_cookies_file()
     if cookie_file.is_file():
         options["cookiefile"] = str(cookie_file)
+
+
+def _add_youtube_extractor_args(options: dict[str, Any]) -> None:
+    options["extractor_args"] = {
+        "youtube": {"player_client": ["default", "web", "android"]}
+    }
 
 
 def youtube_auth_required(error: BaseException | str) -> bool:
@@ -393,6 +403,7 @@ def download_matches(
         "skip_download": True,
         "noplaylist": True,
     }
+    _add_youtube_extractor_args(search_options)
     _add_cookie_file_option(search_options)
 
     with yt_dlp.YoutubeDL(search_options) as searcher:
@@ -522,7 +533,11 @@ def download_matches(
             pass
 
     download_options: dict[str, Any] = {
-        "format": "bestvideo*+bestaudio/best",
+        # "format": "bestvideo*+bestaudio/best",
+        "format": YOUTUBE_FORMAT_SELECTOR,
+        "merge_output_format": "mp4",
+        # "remux_video": "mp4",
+        "remuxvideo": "mp4",
         "outtmpl": str(DOWNLOAD_DIR / "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
@@ -536,6 +551,7 @@ def download_matches(
         # ),
         "match_filter": _candidate_match_filter,
     }
+    _add_youtube_extractor_args(download_options)
     _add_cookie_file_option(download_options)
     if progress_callback:
         download_options["progress_hooks"] = [report_download_progress]

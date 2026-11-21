@@ -53,3 +53,5 @@ un'origine diversa, configura `YOUTUBE_AUTH_ALLOWED_ORIGINS` con le origini fron
 separate da virgole.
 
 La ricerca seleziona esclusivamente video il cui campo licenza di YouTube dichiara una licenza Creative Commons Attribution; risultati senza licenza verificabile vengono ignorati. I file vengono salvati in `downloads/` (massimo 3 per richiesta). Verifica sempre i termini applicabili, i diritti e gli obblighi di attribuzione prima di usare o ridistribuire i contenuti. Questo starter non aggira restrizioni di accesso o protezioni tecniche.
+
+Il downloader prova formati MP4/M4A e ripiega su flussi video/audio WebM o altri formati disponibili. yt-dlp usa FFmpeg per unire e rimuxare i risultati in MP4.
