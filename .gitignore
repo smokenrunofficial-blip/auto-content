@@ -8,6 +8,7 @@ backend/.env.*
 frontend/.angular/
 frontend/dist/
 downloads/
+data/youtube_cookies.txt
 __pycache__/
 *.py[cod]
 .venv/

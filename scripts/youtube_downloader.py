@@ -5,12 +5,16 @@
 import argparse
 import json
 import math
+import os
+import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 import yt_dlp
+from yt_dlp.cookies import extract_cookies_from_browser
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -21,6 +25,160 @@ MIN_SOURCE_VIDEO_DURATION_SECONDS = 60
 MAX_SOURCE_VIDEO_DURATION_SECONDS = 900
 IDEAL_SOURCE_VIDEO_DURATION_MIN_SECONDS = 300
 IDEAL_SOURCE_VIDEO_DURATION_MAX_SECONDS = 600
+SUPPORTED_COOKIE_BROWSERS = {"chrome", "edge", "firefox"}
+YOUTUBE_AUTH_REQUIRED_MESSAGE = (
+    "YouTube richiede l'accesso o la conferma dell'età. "
+    "Clicca su \"Login YouTube (Cache)\" e importa la sessione dal browser "
+    "oppure carica un file cookies.txt."
+)
+
+
+def youtube_cookies_file() -> Path:
+    configured_path = os.environ.get("YOUTUBE_COOKIES_FILE", "").strip()
+    path = Path(configured_path).expanduser() if configured_path else (
+        PROJECT_ROOT / "data" / "youtube_cookies.txt"
+    )
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _count_youtube_cookie_rows(contents: str) -> int:
+    lines = contents.lstrip("\ufeff").splitlines()
+    has_netscape_header = any(
+        line.strip().casefold()
+        in {"# netscape http cookie file", "# http cookie file"}
+        for line in lines
+    )
+    if not has_netscape_header:
+        return 0
+
+    youtube_cookie_count = 0
+    for line in lines:
+        if not line or (line.startswith("#") and not line.startswith("#HttpOnly_")):
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            continue
+        domain = fields[0]
+        if domain.startswith("#HttpOnly_"):
+            domain = domain[len("#HttpOnly_"):]
+        normalized_domain = domain.lstrip(".").casefold()
+        if (
+            normalized_domain == "youtube.com"
+            or normalized_domain.endswith(".youtube.com")
+        ):
+            youtube_cookie_count += 1
+    return youtube_cookie_count
+
+
+def validate_youtube_cookie_file(path: Path) -> int:
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ValueError("Il file cookies.txt non è leggibile in formato UTF-8.") from error
+    count = _count_youtube_cookie_rows(contents)
+    if count == 0:
+        raise ValueError(
+            "Il file non contiene cookie YouTube validi in formato Netscape."
+        )
+    return count
+
+
+def _friendly_browser_cookie_error(browser: str, error: Exception) -> str:
+    detail = str(error).casefold()
+    if any(
+        phrase in detail
+        for phrase in (
+            "locked",
+            "being used",
+            "in use",
+            "permission denied",
+            "access is denied",
+            "could not copy",
+        )
+    ):
+        return (
+            f"Il browser {browser} sta bloccando il database dei cookie. "
+            "Chiudilo completamente e riprova, oppure carica un file cookies.txt."
+        )
+    if any(phrase in detail for phrase in ("not found", "could not find", "unknown browser")):
+        return (
+            f"Il profilo {browser} non è stato trovato. Accedi al browser su questo "
+            "computer oppure carica un file cookies.txt."
+        )
+    if "cookie youtube validi" in detail:
+        return (
+            f"Nel browser {browser} non è stata trovata una sessione YouTube valida. "
+            "Accedi a YouTube nel browser oppure carica un file cookies.txt."
+        )
+    return (
+        f"Non è stato possibile importare la sessione da {browser}. "
+        "Chiudi il browser o carica un file cookies.txt."
+    )
+
+
+def export_browser_cookies(browser: str) -> int:
+    if browser not in SUPPORTED_COOKIE_BROWSERS:
+        raise ValueError("Browser non supportato. Usa chrome, edge o firefox.")
+
+    destination = youtube_cookies_file()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        cookie_jar = extract_cookies_from_browser(browser)
+        with tempfile.NamedTemporaryFile(
+            prefix=".youtube_cookies_",
+            suffix=".txt",
+            dir=destination.parent,
+            delete=False,
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        cookie_jar.save(
+            str(temporary_path),
+            ignore_discard=True,
+            ignore_expires=True,
+        )
+        cookie_count = validate_youtube_cookie_file(temporary_path)
+        if os.name != "nt":
+            temporary_path.chmod(0o600)
+        os.replace(temporary_path, destination)
+        temporary_path = None
+        if os.name != "nt":
+            destination.chmod(0o600)
+        return cookie_count
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        sqlite3.Error,
+        yt_dlp.utils.DownloadError,
+    ) as error:
+        raise RuntimeError(_friendly_browser_cookie_error(browser, error)) from error
+    finally:
+        if temporary_path and temporary_path.exists():
+            temporary_path.unlink(missing_ok=True)
+
+
+def _add_cookie_file_option(options: dict[str, Any]) -> None:
+    cookie_file = youtube_cookies_file()
+    if cookie_file.is_file():
+        options["cookiefile"] = str(cookie_file)
+
+
+def youtube_auth_required(error: BaseException | str) -> bool:
+    detail = str(error).casefold()
+    return (
+        "sign in to confirm your age" in detail
+        or "confirm your age" in detail
+        or "--cookies-from-browser" in detail
+        or "--cookies" in detail
+        or ("youtube" in detail and "cookies" in detail)
+    )
+
+
+def friendly_download_error(error: BaseException | str) -> str:
+    return YOUTUBE_AUTH_REQUIRED_MESSAGE if youtube_auth_required(error) else str(error)
 
 
 def has_allowed_license(license_name: str | None) -> bool:
@@ -235,6 +393,7 @@ def download_matches(
         "skip_download": True,
         "noplaylist": True,
     }
+    _add_cookie_file_option(search_options)
 
     with yt_dlp.YoutubeDL(search_options) as searcher:
         if progress_callback:
@@ -276,7 +435,9 @@ def download_matches(
                             "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
                             "message": (
                                 f"Metadati candidato {index + 1}/{len(entries)} "
-                                f"non disponibili; uso i dati della ricerca ({error})."
+                                # f"non disponibili; uso i dati della ricerca ({error})."
+                                f"non disponibili; uso i dati della ricerca "
+                                f"({friendly_download_error(error)})."
                             ),
                         }
                     )
@@ -375,6 +536,7 @@ def download_matches(
         # ),
         "match_filter": _candidate_match_filter,
     }
+    _add_cookie_file_option(download_options)
     if progress_callback:
         download_options["progress_hooks"] = [report_download_progress]
     downloaded: list[dict[str, str]] = []
@@ -440,7 +602,13 @@ def main() -> int:
             stream.reconfigure(encoding="utf-8", errors="backslashreplace")
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--keyword", required=True, help="Parola chiave o nicchia da cercare")
+    # parser.add_argument("--keyword", required=True, help="Parola chiave o nicchia da cercare")
+    parser.add_argument("--keyword", help="Parola chiave o nicchia da cercare")
+    parser.add_argument(
+        "--export-cookies-from-browser",
+        choices=sorted(SUPPORTED_COOKIE_BROWSERS),
+        help="Salva la sessione YouTube del browser nella cache persistente",
+    )
     # parser.add_argument("--limit", type=int, default=2, help="Numero massimo di download (1-3)")
     parser.add_argument("--limit", type=int, default=2, help="Numero massimo di candidati (1-10)")
     parser.add_argument(
@@ -450,6 +618,25 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.export_cookies_from_browser:
+        try:
+            cookie_count = export_browser_cookies(args.export_cookies_from_browser)
+        except (OSError, RuntimeError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(
+            json.dumps(
+                {
+                    "success": True,
+                    "browser": args.export_cookies_from_browser,
+                    "cookie_count": cookie_count,
+                }
+            )
+        )
+        return 0
+
+    if args.keyword is None:
+        parser.error("--keyword è richiesto per cercare e scaricare video")
     keyword = args.keyword.strip()
     if not 2 <= len(keyword) <= 120:
         parser.error("--keyword deve contenere da 2 a 120 caratteri")
@@ -464,7 +651,11 @@ def main() -> int:
         )
         videos = download_matches(keyword, args.limit, progress_callback)
     except (OSError, RuntimeError, yt_dlp.utils.DownloadError) as error:
-        print(f"Ricerca o download non riuscito: {error}", file=sys.stderr)
+        # print(f"Ricerca o download non riuscito: {error}", file=sys.stderr)
+        print(
+            f"Ricerca o download non riuscito: {friendly_download_error(error)}",
+            file=sys.stderr,
+        )
         return 1
 
     result = {"keyword": keyword, "videos": videos}

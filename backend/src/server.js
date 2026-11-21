@@ -1,7 +1,19 @@
 import { execFile, spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { access, readdir, realpath } from 'node:fs/promises';
+// import { access, readdir, realpath } from 'node:fs/promises';
+import {
+  access,
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dirname, extname, isAbsolute, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
@@ -17,6 +29,17 @@ const app = express();
 const execFileAsync = promisify(execFile);
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const downloaderPath = resolve(projectRoot, 'scripts', 'youtube_downloader.py');
+const configuredYoutubeCookiesFile = process.env.YOUTUBE_COOKIES_FILE?.trim();
+const expandedYoutubeCookiesFile =
+  configuredYoutubeCookiesFile === '~'
+    ? homedir()
+    : configuredYoutubeCookiesFile?.startsWith('~/')
+      ? resolve(homedir(), configuredYoutubeCookiesFile.slice(2))
+      : configuredYoutubeCookiesFile || 'data/youtube_cookies.txt';
+const youtubeCookiesFile = resolve(
+  projectRoot,
+  expandedYoutubeCookiesFile,
+);
 // const VIDEO_CANDIDATE_LIMIT = 10;
 const VIDEO_CANDIDATE_LIMIT = 2;
 const scriptsDirectory = resolve(projectRoot, 'scripts');
@@ -45,8 +68,138 @@ const stageProgressRanges = {
 const allowedVideoExtensions = new Set(['.mp4', '.mkv', '.webm', '.mov', '.m4v']);
 const jobs = new Map();
 const port = Number(process.env.PORT ?? 3000);
+const youtubeAuthRequiredMessage = [
+  'YouTube richiede l’accesso o la conferma dell’età.',
+  'Clicca su "Login YouTube (Cache)" e importa la sessione dal browser oppure carica un file cookies.txt.',
+].join(' ');
 
 app.use(express.json({ limit: '20kb' }));
+
+function isAllowedYoutubeAuthOrigin(request) {
+  const origin = request.get('origin');
+  if (!origin) return false;
+  const configuredOrigins = (process.env.YOUTUBE_AUTH_ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const allowedOrigins = new Set([
+    'http://localhost:4200',
+    'http://127.0.0.1:4200',
+    ...configuredOrigins,
+  ]);
+  return allowedOrigins.has(origin);
+}
+
+function countYoutubeCookieRows(contents) {
+  const lines = contents.replace(/^\uFEFF/, '').split(/\r?\n/);
+  const hasNetscapeHeader = lines.some((line) =>
+    ['# netscape http cookie file', '# http cookie file'].includes(line.trim().toLowerCase()),
+  );
+  if (!hasNetscapeHeader) return 0;
+
+  return lines.reduce((count, line) => {
+    if (!line || (line.startsWith('#') && !line.startsWith('#HttpOnly_'))) return count;
+    const fields = line.split('\t');
+    if (
+      fields.length !== 7 ||
+      !['true', 'false'].includes(fields[1].toLowerCase()) ||
+      !fields[2].startsWith('/') ||
+      !['true', 'false'].includes(fields[3].toLowerCase()) ||
+      !/^\d+$/.test(fields[4]) ||
+      !fields[5]
+    ) {
+      return count;
+    }
+
+    const domain = fields[0].replace(/^#HttpOnly_/, '').replace(/^\./, '').toLowerCase();
+    return domain === 'youtube.com' || domain.endsWith('.youtube.com') ? count + 1 : count;
+  }, 0);
+}
+
+async function getYoutubeAuthStatus() {
+  let contents;
+  try {
+    contents = await readFile(youtubeCookiesFile, 'utf8');
+  } catch (error) {
+    if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+      return { connected: false, cookieCount: 0 };
+    }
+    throw error;
+  }
+  const cookieCount = countYoutubeCookieRows(contents);
+  return { connected: cookieCount > 0, cookieCount };
+}
+
+async function saveYoutubeCookieContents(contents) {
+  const cookieCount = countYoutubeCookieRows(contents);
+  if (!cookieCount) {
+    throw new Error('Il file non contiene cookie YouTube validi in formato Netscape.');
+  }
+
+  const temporaryFile = resolve(
+    dirname(youtubeCookiesFile),
+    `.${randomUUID()}.youtube-cookies.tmp`,
+  );
+  await mkdir(dirname(youtubeCookiesFile), { recursive: true });
+  try {
+    await writeFile(temporaryFile, contents, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    if (process.platform !== 'win32') await chmod(temporaryFile, 0o600);
+    await rename(temporaryFile, youtubeCookiesFile);
+    return cookieCount;
+  } catch (error) {
+    await rm(temporaryFile, { force: true });
+    throw error;
+  }
+}
+
+function normalizeYoutubeDownloadError(message) {
+  if (
+    /sign in to confirm your age|confirm your age/i.test(message) ||
+    /--cookies(?:-from-browser)?/i.test(message) ||
+    /youtube.{0,30}cookies/i.test(message)
+  ) {
+    return youtubeAuthRequiredMessage;
+  }
+  return message;
+}
+
+function browserCookieImportError(error, browser) {
+  const details = [
+    error && typeof error === 'object' && 'stderr' in error ? String(error.stderr) : '',
+    error instanceof Error ? error.message : '',
+  ]
+    .join(' ')
+    .toLowerCase();
+  if (
+    /locked|being used|in use|permission denied|access is denied|could not copy|bloccando/.test(
+      details,
+    )
+  ) {
+    return [
+      `Il browser ${browser} sta bloccando il database dei cookie.`,
+      'Chiudilo completamente e riprova, oppure carica un file cookies.txt.',
+    ].join(' ');
+  }
+  if (/not found|could not find|unknown browser/.test(details)) {
+    return [
+      `Il profilo ${browser} non è stato trovato.`,
+      'Accedi al browser su questo computer oppure carica un file cookies.txt.',
+    ].join(' ');
+  }
+  if (/non contiene cookie|sessione youtube valida/.test(details)) {
+    return [
+      `Nel browser ${browser} non è stata trovata una sessione YouTube valida.`,
+      'Accedi a YouTube nel browser oppure carica un file cookies.txt.',
+    ].join(' ');
+  }
+  if (error && typeof error === 'object' && 'code' in error && error.code === 'ENOENT') {
+    return 'Non è stato possibile avviare Python/yt-dlp. Verifica la configurazione del backend.';
+  }
+  return [
+    `Non è stato possibile importare la sessione da ${browser}.`,
+    'Chiudi il browser o carica un file cookies.txt.',
+  ].join(' ');
+}
 
 function createPipelineJob(keyword) {
   return {
@@ -254,7 +407,13 @@ function runJobProcess(job, executable, args, cwd, onResult) {
     if (job.status === 'failed') return;
     if (stdoutBuffer.trim()) handleLine(stdoutBuffer);
     if (code !== 0) {
-      failPipelineJob(job, stderr.trim() || `Il processo Python è terminato con codice ${code}.`);
+      // failPipelineJob(job, stderr.trim() || `Il processo Python è terminato con codice ${code}.`);
+      failPipelineJob(
+        job,
+        normalizeYoutubeDownloadError(
+          stderr.trim() || `Il processo Python è terminato con codice ${code}.`,
+        ),
+      );
       return;
     }
     if (!resultReceived) {
@@ -483,6 +642,83 @@ app.get('/api/health', (_request, response) => {
   response.json({ status: 'ok' });
 });
 
+app.get('/api/youtube/auth/status', async (_request, response) => {
+  response.set('Cache-Control', 'no-store');
+  try {
+    response.json(await getYoutubeAuthStatus());
+  } catch {
+    response.status(500).json({ error: 'Non è stato possibile verificare la cache YouTube.' });
+  }
+});
+
+app.post(
+  '/api/youtube/auth',
+  express.text({ type: 'text/plain', limit: '1mb' }),
+  async (request, response) => {
+    response.set('Cache-Control', 'no-store');
+    if (!isAllowedYoutubeAuthOrigin(request)) {
+      response.status(403).json({ error: 'Origine non autorizzata per la sessione YouTube.' });
+      return;
+    }
+
+    if (typeof request.body === 'string') {
+      if (!countYoutubeCookieRows(request.body)) {
+        response.status(400).json({
+          error: 'Il file non contiene cookie YouTube validi in formato Netscape.',
+        });
+        return;
+      }
+      try {
+        const cookieCount = await saveYoutubeCookieContents(request.body);
+        response.json({ connected: true, cookieCount });
+      } catch {
+        response.status(500).json({ error: 'Non è stato possibile salvare la cache YouTube.' });
+      }
+      return;
+    }
+
+    const { mode, browser } = request.body ?? {};
+    if (
+      mode !== 'browser' ||
+      typeof browser !== 'string' ||
+      !['chrome', 'edge', 'firefox'].includes(browser)
+    ) {
+      response.status(400).json({
+        error: 'Scegli Chrome, Edge o Firefox per importare la sessione dal browser.',
+      });
+      return;
+    }
+
+    try {
+      await execFileAsync(
+        process.env.PYTHON_EXECUTABLE || 'python',
+        [downloaderPath, '--export-cookies-from-browser', browser],
+        {
+          cwd: projectRoot,
+          env: {
+            ...process.env,
+            PYTHONIOENCODING: 'utf-8',
+            YOUTUBE_COOKIES_FILE: youtubeCookiesFile,
+          },
+          timeout: 120 * 1000,
+          maxBuffer: 256 * 1024,
+          windowsHide: true,
+        },
+      );
+      const status = await getYoutubeAuthStatus();
+      if (!status.connected) {
+        response.status(422).json({
+          error: 'Nel browser non è stata trovata una sessione YouTube valida.',
+        });
+        return;
+      }
+      response.json(status);
+    } catch (error) {
+      response.status(502).json({ error: browserCookieImportError(error, browser) });
+    }
+  },
+);
+
 app.post('/api/downloads', async (request, response) => {
   const { keyword, limit = 2 } = request.body ?? {};
 
@@ -518,7 +754,10 @@ app.post('/api/downloads', async (request, response) => {
       error && typeof error === 'object' && 'stderr' in error
         ? String(error.stderr).trim()
         : '';
-    const message = details || (error instanceof Error ? error.message : 'Errore inatteso.');
+    // const message = details || (error instanceof Error ? error.message : 'Errore inatteso.');
+    const message = normalizeYoutubeDownloadError(
+      details || (error instanceof Error ? error.message : 'Errore inatteso.'),
+    );
     console.error('Download non riuscito:', message);
     response.status(502).json({ error: message });
   }

@@ -42,4 +42,14 @@ Per `/api/chat`, Qwen riceve uno schema JSON che richiede `scene_summary`, `acti
 
 ## Download e licenze
 
+Per i video che richiedono l'accesso, usa **Login YouTube (Cache)** nella UI: puoi importare la
+sessione da Chrome, Edge o Firefox, oppure caricare un `cookies.txt` in formato Netscape. La cache
+locale predefinita è `data/youtube_cookies.txt` (ignorata da Git); per cambiarla imposta
+`YOUTUBE_COOKIES_FILE`. La UI usa `POST /api/youtube/auth` per importare e
+`GET /api/youtube/auth/status` per verificare la cache. I cookie sono conservati solo dal backend e
+non vengono restituiti dall'API. Se il browser blocca il database, chiudilo completamente o usa
+l'importazione del file. La UI locale su `http://localhost:4200` è autorizzata per l'import; per
+un'origine diversa, configura `YOUTUBE_AUTH_ALLOWED_ORIGINS` con le origini frontend consentite,
+separate da virgole.
+
 La ricerca seleziona esclusivamente video il cui campo licenza di YouTube dichiara una licenza Creative Commons Attribution; risultati senza licenza verificabile vengono ignorati. I file vengono salvati in `downloads/` (massimo 3 per richiesta). Verifica sempre i termini applicabili, i diritti e gli obblighi di attribuzione prima di usare o ridistribuire i contenuti. Questo starter non aggira restrizioni di accesso o protezioni tecniche.

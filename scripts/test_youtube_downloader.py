@@ -112,6 +112,26 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertEqual(download.call_args.args[:2], ("ceramica", 10))
         self.assertTrue(callable(download.call_args.args[2]))
 
+    def test_main_can_export_browser_cookies_without_a_search_keyword(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            patch.object(
+                youtube_downloader.sys,
+                "argv",
+                ["youtube_downloader.py", "--export-cookies-from-browser", "firefox"],
+            ),
+            patch.object(youtube_downloader.sys, "stdout", stdout),
+            patch.object(youtube_downloader.sys, "stderr", stderr),
+            patch.object(youtube_downloader, "export_browser_cookies", return_value=3) as export,
+        ):
+            result_code = youtube_downloader.main()
+
+        self.assertEqual(result_code, 0)
+        export.assert_called_once_with("firefox")
+        self.assertEqual(json.loads(stdout.getvalue())["cookie_count"], 3)
+        self.assertEqual(stderr.getvalue(), "")
+
     def test_one_download_failure_does_not_stop_later_candidates(self) -> None:
         attempted_downloads = []
         video_metadata = {
@@ -445,6 +465,110 @@ class AllowedLicenseTests(unittest.TestCase):
 
         self.assertEqual(downloaded_ids, ["ideal12345"])
         self.assertEqual([video["id"] for video in videos], ["ideal12345"])
+
+    def test_cookie_file_is_passed_to_search_metadata_and_download_calls(self) -> None:
+        captured_options = []
+        metadata = {
+            "id": "cookie12345",
+            "title": "Video con sessione",
+            "webpage_url": "https://youtube.com/watch?v=cookie12345",
+            "duration": 420,
+            "width": 1280,
+            "height": 720,
+            "filepath": "cookie12345.mp4",
+        }
+
+        class FakeYouTubeDL:
+            def __init__(self, options):
+                captured_options.append(options)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc_info):
+                return not exc_info
+
+            def extract_info(self, url, download=False):
+                if url.startswith("ytsearch"):
+                    return {"entries": [{"webpage_url": metadata["webpage_url"]}]}
+                return dict(metadata)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie_file = Path(temporary) / "youtube_cookies.txt"
+            cookie_file.write_text("# Netscape HTTP Cookie File\n", encoding="utf-8")
+            with (
+                patch.dict(
+                    youtube_downloader.os.environ,
+                    {"YOUTUBE_COOKIES_FILE": str(cookie_file)},
+                ),
+                patch.object(youtube_downloader, "DOWNLOAD_DIR", Path(temporary) / "downloads"),
+                patch.object(youtube_downloader.yt_dlp, "YoutubeDL", FakeYouTubeDL),
+            ):
+                videos = youtube_downloader.download_matches("ceramica", 1)
+
+        self.assertEqual(len(videos), 1)
+        self.assertEqual(len(captured_options), 3)
+        self.assertTrue(
+            all(options.get("cookiefile") == str(cookie_file) for options in captured_options)
+        )
+
+    def test_exports_browser_cookies_to_a_private_netscape_cache(self) -> None:
+        class FakeCookieJar:
+            def save(self, filename, *, ignore_discard, ignore_expires):
+                self.assert_save_options(ignore_discard, ignore_expires)
+                Path(filename).write_text(
+                    "# Netscape HTTP Cookie File\n"
+                    "#HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t0\tSID\ttest-value\n",
+                    encoding="utf-8",
+                )
+
+            @staticmethod
+            def assert_save_options(ignore_discard, ignore_expires):
+                if not ignore_discard or not ignore_expires:
+                    raise AssertionError("Session cookies must be included in the exported cache.")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cookie_file = Path(temporary) / "data" / "youtube_cookies.txt"
+            with (
+                patch.object(youtube_downloader, "youtube_cookies_file", return_value=cookie_file),
+                patch.object(
+                    youtube_downloader,
+                    "extract_cookies_from_browser",
+                    return_value=FakeCookieJar(),
+                ) as extract,
+            ):
+                cookie_count = youtube_downloader.export_browser_cookies("chrome")
+
+            self.assertEqual(cookie_count, 1)
+            self.assertEqual(extract.call_args.args, ("chrome",))
+            self.assertIn("test-value", cookie_file.read_text(encoding="utf-8"))
+            if youtube_downloader.os.name != "nt":
+                self.assertEqual(cookie_file.stat().st_mode & 0o777, 0o600)
+
+    def test_browser_cookie_database_lock_has_a_clear_fallback_message(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch.object(
+                    youtube_downloader,
+                    "youtube_cookies_file",
+                    return_value=Path(temporary) / "youtube_cookies.txt",
+                ),
+                patch.object(
+                    youtube_downloader,
+                    "extract_cookies_from_browser",
+                    side_effect=OSError("database is locked"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "Chiudilo completamente"):
+                    youtube_downloader.export_browser_cookies("chrome")
+
+    def test_age_restriction_errors_prompt_for_cached_youtube_login(self) -> None:
+        message = youtube_downloader.friendly_download_error(
+            "Sign in to confirm your age. Use --cookies-from-browser or --cookies."
+        )
+
+        self.assertIn("Login YouTube (Cache)", message)
+        self.assertTrue(youtube_downloader.youtube_auth_required(message))
 
 
 if __name__ == "__main__":

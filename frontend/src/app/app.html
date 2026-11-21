@@ -11,6 +11,102 @@
       </p>
     </header>
 
+    <div class="mb-6">
+      <button
+        class="inline-flex items-center gap-3 rounded-lg border border-slate-700 bg-slate-900 px-4 py-3 text-sm font-semibold text-slate-100 transition hover:border-cyan-400"
+        type="button"
+        aria-controls="youtube-auth-panel"
+        [attr.aria-expanded]="youtubeAuthPanelOpen()"
+        (click)="toggleYoutubeAuthPanel()"
+      >
+        Login YouTube (Cache)
+        <span
+          class="rounded-full px-2 py-1 text-xs"
+          [class.bg-emerald-950]="youtubeAuthConnected()"
+          [class.text-emerald-300]="youtubeAuthConnected()"
+          [class.bg-slate-800]="!youtubeAuthConnected()"
+          [class.text-slate-300]="!youtubeAuthConnected()"
+          aria-live="polite"
+        >
+          {{
+            !youtubeAuthChecked()
+              ? 'Verifica…'
+              : youtubeAuthConnected()
+                ? 'Connesso'
+                : 'Non connesso'
+          }}
+        </span>
+      </button>
+    </div>
+
+    @if (youtubeAuthPanelOpen()) {
+      <section
+        id="youtube-auth-panel"
+        class="mb-6 grid gap-4 rounded-2xl border border-slate-800 bg-slate-900 p-6"
+        role="region"
+        aria-labelledby="youtube-auth-title"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <h2 id="youtube-auth-title" class="text-xl font-semibold">Sessione YouTube</h2>
+            <p class="mt-1 text-sm text-slate-400">
+              La sessione viene salvata solo nella cache locale del backend.
+            </p>
+          </div>
+          <button
+            class="rounded-lg px-3 py-2 text-sm text-slate-300 hover:bg-slate-800"
+            type="button"
+            (click)="toggleYoutubeAuthPanel()"
+          >
+            Chiudi
+          </button>
+        </div>
+
+        <label class="block max-w-sm">
+          <span class="mb-2 block text-sm font-medium text-slate-200">Browser</span>
+          <select
+            class="w-full rounded-lg border border-slate-700 bg-slate-950 px-4 py-3 text-slate-100"
+            name="youtubeBrowser"
+            [(ngModel)]="youtubeBrowser"
+          >
+            <option value="chrome">Chrome</option>
+            <option value="edge">Edge</option>
+            <option value="firefox">Firefox</option>
+          </select>
+        </label>
+
+        <div class="flex flex-wrap gap-3">
+          <button
+            class="rounded-lg bg-cyan-400 px-4 py-3 text-sm font-semibold text-slate-950 hover:bg-cyan-300 disabled:cursor-not-allowed disabled:opacity-60"
+            type="button"
+            [disabled]="youtubeAuthBusy()"
+            (click)="importYoutubeBrowserSession()"
+          >
+            {{ youtubeAuthBusy() ? 'Importazione…' : 'Importa sessione dal Browser' }}
+          </button>
+          <label
+            class="inline-flex cursor-pointer items-center rounded-lg border border-slate-700 px-4 py-3 text-sm font-semibold text-slate-100 hover:border-cyan-400"
+          >
+            Carica cookies.txt
+            <input
+              class="sr-only"
+              type="file"
+              accept=".txt,text/plain"
+              [disabled]="youtubeAuthBusy()"
+              (change)="uploadYoutubeCookieFile($event)"
+            />
+          </label>
+        </div>
+
+        @if (youtubeAuthMessage()) {
+          <p class="text-sm text-emerald-300" role="status">{{ youtubeAuthMessage() }}</p>
+        }
+        @if (youtubeAuthError()) {
+          <p class="text-sm text-rose-300" role="alert">{{ youtubeAuthError() }}</p>
+        }
+      </section>
+    }
+
     <form
       class="grid gap-5 rounded-2xl border border-slate-800 bg-slate-900 p-6 shadow-xl sm:grid-cols-[1fr_auto] sm:items-end"
       (ngSubmit)="download()"
