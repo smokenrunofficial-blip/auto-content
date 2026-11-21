@@ -18,6 +18,8 @@ FACE_DETECTION_MAX_WIDTH = 480
 FACE_DETECTION_SAMPLE_INTERVAL_SECONDS = 0.5
 FACE_TRACK_SMOOTHING = 0.45
 FACE_TRACK_MAX_STEP = 0.12
+FACE_TRACK_GRACE_PERIOD_SECONDS = 1.5
+FACE_CROP_SAFE_MARGIN_RATIO = 0.2
 LOGGER = logging.getLogger(__name__)
 
 
@@ -39,6 +41,48 @@ def _escape_filter_path(path: Path) -> str:
         .replace("'", r"\'")
         .replace(",", r"\,")
     )
+
+
+def _horror_overlay_filter_expression() -> str | None:
+    enabled_value = os.environ.get("HORROR_OVERLAY_ENABLED", "1").strip().casefold()
+    if enabled_value not in {"1", "true", "yes", "on", "0", "false", "no", "off"}:
+        raise ValueError("HORROR_OVERLAY_ENABLED deve essere un valore booleano.")
+    if enabled_value in {"0", "false", "no", "off"}:
+        return None
+
+    mode = os.environ.get("HORROR_OVERLAY_MODE", "analog").strip().casefold()
+    if mode == "off":
+        return None
+    if mode not in {"analog", "noise", "scanlines"}:
+        raise ValueError(
+            "HORROR_OVERLAY_MODE deve essere 'analog', 'noise', 'scanlines' o 'off'."
+        )
+    try:
+        noise_level = int(os.environ.get("HORROR_OVERLAY_NOISE", "4"))
+        scanline_opacity = float(
+            os.environ.get("HORROR_OVERLAY_SCANLINE_OPACITY", "0.12")
+        )
+    except ValueError as error:
+        raise ValueError(
+            "HORROR_OVERLAY_NOISE e HORROR_OVERLAY_SCANLINE_OPACITY "
+            "devono essere valori numerici."
+        ) from error
+    if not 0 <= noise_level <= 100:
+        raise ValueError("HORROR_OVERLAY_NOISE deve essere compreso tra 0 e 100.")
+    if not math.isfinite(scanline_opacity) or not 0.0 <= scanline_opacity <= 1.0:
+        raise ValueError(
+            "HORROR_OVERLAY_SCANLINE_OPACITY deve essere compreso tra 0 e 1."
+        )
+
+    filters: list[str] = []
+    if mode in {"analog", "noise"} and noise_level:
+        filters.append(f"noise=alls={noise_level}:allf=t+u")
+    if mode in {"analog", "scanlines"} and scanline_opacity:
+        filters.append(
+            "drawgrid=width=iw:height=6:thickness=1:"
+            f"color=black@{scanline_opacity:.3f}"
+        )
+    return ",".join(filters) or None
 
 
 def audio_duration(audio_path: Path) -> float:
@@ -142,6 +186,59 @@ def _bounded_focus_x(value: float) -> float:
     if not math.isfinite(value):
         return 0.5
     return max(0.0, min(1.0, value))
+
+
+def _face_safe_focus_x(
+    face_center: float,
+    face_width: float,
+    crop_width_ratio: float,
+) -> float:
+    center = _bounded_focus_x(face_center)
+    crop_width = max(0.0, min(1.0, crop_width_ratio))
+    face_width = max(0.0, min(1.0, face_width))
+    if crop_width >= 1.0 or face_width <= 0.0:
+        return center
+
+    half_crop = crop_width / 2
+    half_face = face_width / 2
+    margin = face_width * FACE_CROP_SAFE_MARGIN_RATIO
+    lower_bound = max(
+        half_crop,
+        center + half_face + margin - half_crop,
+    )
+    upper_bound = min(
+        1.0 - half_crop,
+        center - half_face - margin + half_crop,
+    )
+    if lower_bound > upper_bound:
+        return max(half_crop, min(1.0 - half_crop, center))
+    return max(lower_bound, min(upper_bound, center))
+
+
+def _fill_face_detection_gaps(
+    sample_times: list[float],
+    detected_focus: list[float | None],
+    fallback_focus: float,
+) -> list[float | None]:
+    if len(sample_times) != len(detected_focus):
+        raise ValueError(
+            "I campioni temporali e i punti focali devono avere la stessa lunghezza."
+        )
+
+    filled = list(detected_focus)
+    previous_time: float | None = None
+    previous_focus: float | None = None
+    fallback = _bounded_focus_x(fallback_focus)
+    for index, (sample_time, focus) in enumerate(zip(sample_times, detected_focus)):
+        if focus is not None:
+            previous_time = sample_time
+            previous_focus = _bounded_focus_x(focus)
+        elif previous_time is not None and previous_focus is not None:
+            if sample_time - previous_time <= FACE_TRACK_GRACE_PERIOD_SECONDS:
+                filled[index] = previous_focus
+            else:
+                filled[index] = fallback
+    return filled
 
 
 def _sample_clip_times(duration: float) -> list[float]:
@@ -371,13 +468,27 @@ def _detect_face_focus_tracks(
                         -(face[2] * face[3]),
                     ),
                 )
-                face_center = _bounded_focus_x(
-                    (selected_face[0] + selected_face[2] / 2) / resized_width
+                # face_center = _bounded_focus_x(
+                #     (selected_face[0] + selected_face[2] / 2) / resized_width
+                # )
+                crop_width_ratio = min(
+                    1.0,
+                    frame_height * 9.0 / (16.0 * frame_width),
+                )
+                face_center = _face_safe_focus_x(
+                    (selected_face[0] + selected_face[2] / 2) / resized_width,
+                    selected_face[2] / resized_width,
+                    crop_width_ratio,
                 )
                 detected_focus.append(face_center)
                 previous_detected = face_center
                 detection_count += 1
 
+            detected_focus = _fill_face_detection_gaps(
+                sample_times,
+                detected_focus,
+                fallback_focus,
+            )
             track = _smooth_focus_track(
                 sample_times,
                 detected_focus,
@@ -480,12 +591,21 @@ def render_vertical_short(
         )
 
     concatenated = "".join(f"[clip{index}]" for index in range(len(clips)))
+    # filters.append(
+    #     f"{concatenated}concat=n={len(clips)}:v=1:a=0[video];"
+    #     f"[video]subtitles=filename='captions.ass':"
+    #     f"fontsdir='{_escape_filter_path(CAPTION_FONT_DIRECTORY)}'[output]"
+    # )
     filters.append(
-        f"{concatenated}concat=n={len(clips)}:v=1:a=0[video];"
-        # "[video]subtitles=captions.ass:"
-        # "force_style='FontName=Arial,FontSize=62,Alignment=2,MarginV=170'[output]"
-        # "[video]subtitles=captions.ass[output]"
-        f"[video]subtitles=filename='captions.ass':"
+        f"{concatenated}concat=n={len(clips)}:v=1:a=0[video]"
+    )
+    subtitle_input = "[video]"
+    horror_overlay = _horror_overlay_filter_expression()
+    if horror_overlay:
+        filters.append(f"[video]{horror_overlay}[analog]")
+        subtitle_input = "[analog]"
+    filters.append(
+        f"{subtitle_input}subtitles=filename='captions.ass':"
         f"fontsdir='{_escape_filter_path(CAPTION_FONT_DIRECTORY)}'[output]"
     )
     if background_music is None:

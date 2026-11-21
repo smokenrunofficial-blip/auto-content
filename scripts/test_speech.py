@@ -14,6 +14,21 @@ from video_pipeline import process_video, speech
 
 
 class SpeechTests(unittest.TestCase):
+    def test_narration_normalization_removes_markdown_symbols_and_ends_sentences(self) -> None:
+        normalized = speech.normalize_narration_text(
+            "**La porta** si aprì lentamente 🔥 senza alcun rumore"
+        )
+
+        self.assertEqual(normalized, "La porta si aprì lentamente senza alcun rumore.")
+
+    def test_narration_normalization_adds_breaths_to_long_unpunctuated_text(self) -> None:
+        text = " ".join(f"parola{index}" for index in range(50))
+
+        normalized = speech.normalize_narration_text(text)
+
+        self.assertGreaterEqual(normalized.count(","), 2)
+        self.assertTrue(normalized.endswith("."))
+
 #     def test_synthesis_posts_configured_voice_and_writes_audio(self) -> None:
 #         audio = b"mock mp3 audio"
 #         with tempfile.TemporaryDirectory() as temporary:
@@ -154,7 +169,8 @@ class SpeechTests(unittest.TestCase):
         )
         self.assertEqual(
             json.loads(request.data),
-            {"text": "Ciao mondo", "language": "it"},
+            # {"text": "Ciao mondo", "language": "it"},
+            {"text": "Ciao mondo.", "language": "it"},
         )
         self.assertEqual(saved_audio, audio)
 

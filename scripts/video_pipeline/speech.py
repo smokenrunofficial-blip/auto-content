@@ -2,7 +2,9 @@ import json
 import gc
 import logging
 import os
+import re
 import sys
+import unicodedata
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,95 @@ from .events import report_progress
 # LOCAL_TTS_TIMEOUT_SECONDS = 120
 LOCAL_TTS_TIMEOUT_SECONDS = 600
 LOGGER = logging.getLogger(__name__)
+_NARRATION_PUNCTUATION = frozenset(".,!?;:…'’‘\"“”«»—–-()[]")
+_BREATH_CONNECTORS = frozenset(
+    {
+        "although",
+        "before",
+        "because",
+        "but",
+        "eppure",
+        "finché",
+        "mentre",
+        "ma",
+        "perché",
+        "perche",
+        "poi",
+        "quando",
+        "se",
+        "though",
+        "while",
+        "yet",
+    }
+)
+
+
+def _add_breath_commas(sentence: str, max_words: int = 22) -> str:
+    words = sentence.split()
+    chunks: list[str] = []
+    while len(words) > max_words:
+        split_at = 18
+        natural_breaks = [
+            index
+            for index in range(13, min(22, len(words) - 1))
+            if re.sub(r"^[^\w]+|[^\w]+$", "", words[index]).casefold()
+            in _BREATH_CONNECTORS
+        ]
+        if natural_breaks:
+            split_at = min(natural_breaks, key=lambda index: abs(index - 18))
+        first_chunk = words[:split_at]
+        if not re.search(r"[,;:]$", first_chunk[-1]):
+            first_chunk[-1] += ","
+        chunks.append(" ".join(first_chunk))
+        words = words[split_at:]
+    chunks.append(" ".join(words))
+    return " ".join(chunks)
+
+
+def normalize_narration_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"```.*?```", " ", text, flags=re.DOTALL)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"(?m)^\s*#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s*>\s?", "", text)
+    text = re.sub(r"(?m)^\s*(?:[-*+]\s+|\d+[.)]\s+)", "", text)
+    text = re.sub(r"`+", "", text)
+    text = re.sub(r"[*_~]", "", text)
+    text = re.sub(r"<[^>]*>", " ", text)
+    text = re.sub(r"\bhttps?://\S+", " ", text, flags=re.IGNORECASE)
+
+    text = "".join(
+        character
+        for character in text
+        if character.isspace()
+        or unicodedata.category(character)[0] in {"L", "M", "N"}
+        or character in _NARRATION_PUNCTUATION
+    )
+    text = re.sub(r"(?:\.\s*){4,}", "...", text)
+    text = re.sub(r"!{2,}", "!", text)
+    text = re.sub(r"\?{2,}", "?", text)
+    text = re.sub(r"([,;:])\1+", r"\1", text)
+    text = re.sub(r"\s+([,.!?;:…])", r"\1", text)
+
+    lines: list[str] = []
+    for raw_line in text.splitlines() or [text]:
+        line = re.sub(r"\s+", " ", raw_line).strip()
+        if not line:
+            continue
+        line = _add_breath_commas(line)
+        closing = re.search(r"""(["'’”»)\]]*)$""", line)
+        closing_quotes = closing.group(0) if closing else ""
+        body = line[: -len(closing_quotes)] if closing_quotes else line
+        if not re.search(r"[.!?…]$", body):
+            body = re.sub(r"[,;:—–-]+$", "", body.rstrip())
+            line = f"{body}.{closing_quotes}"
+        lines.append(line)
+
+    normalized = re.sub(r"\s+", " ", " ".join(lines)).strip()
+    if not normalized:
+        raise ValueError("Lo script narrativo è vuoto dopo la normalizzazione.")
+    return normalized
 
 
 def _clear_cuda_memory() -> bool:
@@ -201,6 +292,7 @@ def synthesize_narration(
     destination: Path,
     language: str = "it",
 ) -> None:
+    text = normalize_narration_text(text)
     if len(text) > 5000:
         raise ValueError("Lo script supera il limite iniziale di 5000 caratteri.")
 

@@ -20,8 +20,11 @@ from video_pipeline import speech
 # from video_pipeline.render import render_vertical_short
 from video_pipeline.render import (
     _detect_face_focus_tracks,
+    _face_safe_focus_x,
     _fallback_focus_tracks,
+    _fill_face_detection_gaps,
     _focus_track_expression,
+    _horror_overlay_filter_expression,
     _smooth_focus_track,
     render_vertical_short,
 )
@@ -352,6 +355,58 @@ class VideoPipelineTests(unittest.TestCase):
             )
         )
 
+    def test_face_crop_focus_keeps_safe_horizontal_margins(self) -> None:
+        face_center = 0.85
+        face_width = 0.2
+        crop_width_ratio = 0.32
+        crop_center = _face_safe_focus_x(
+            face_center,
+            face_width,
+            crop_width_ratio,
+        )
+        crop_left = crop_center - crop_width_ratio / 2
+        crop_right = crop_center + crop_width_ratio / 2
+        face_left = face_center - face_width / 2
+        face_right = face_center + face_width / 2
+        margin = face_width * 0.2
+
+        self.assertLessEqual(crop_left, face_left - margin)
+        self.assertGreaterEqual(crop_right, face_right + margin)
+
+    def test_face_tracking_holds_brief_gaps_then_uses_scene_fallback(self) -> None:
+        filled = _fill_face_detection_gaps(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+            [0.2, None, None, None, None, 0.8, None],
+            fallback_focus=0.5,
+        )
+
+        self.assertEqual(filled, [0.2, 0.2, 0.2, 0.2, 0.5, 0.8, 0.8])
+
+    def test_horror_overlay_is_configurable_and_applies_to_the_full_video(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "HORROR_OVERLAY_ENABLED": "1",
+                "HORROR_OVERLAY_MODE": "analog",
+                "HORROR_OVERLAY_NOISE": "4",
+                "HORROR_OVERLAY_SCANLINE_OPACITY": "0.12",
+            },
+            clear=True,
+        ):
+            expression = _horror_overlay_filter_expression()
+        self.assertEqual(
+            expression,
+            "noise=alls=4:allf=t+u,"
+            "drawgrid=width=iw:height=6:thickness=1:color=black@0.120",
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"HORROR_OVERLAY_ENABLED": "0"},
+            clear=True,
+        ):
+            self.assertIsNone(_horror_overlay_filter_expression())
+
     def test_face_focus_fallback_stays_centered_and_builds_time_expression(self) -> None:
         tracks = _fallback_focus_tracks(
             [Clip(0.0, 3.0, 0.5, focus_x=0.95)],
@@ -434,6 +489,15 @@ class VideoPipelineTests(unittest.TestCase):
                         [(0.0, 0.5), (2.0, 0.5)],
                     ],
                 ),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "HORROR_OVERLAY_ENABLED": "1",
+                        "HORROR_OVERLAY_MODE": "analog",
+                        "HORROR_OVERLAY_NOISE": "4",
+                        "HORROR_OVERLAY_SCANLINE_OPACITY": "0.12",
+                    },
+                ),
                 patch("video_pipeline.render._measure_audio_peak", return_value=-12.0),
                 patch(
                     "video_pipeline.render._verify_rendered_audio",
@@ -461,7 +525,10 @@ class VideoPipelineTests(unittest.TestCase):
         filter_graph = command[command.index("-filter_complex") + 1]
         self.assertIn("concat=n=3", filter_graph)
         # self.assertIn("[video]subtitles=captions.ass[output]", filter_graph)
-        self.assertIn("[video]subtitles=filename='captions.ass':", filter_graph)
+        # self.assertIn("[video]subtitles=filename='captions.ass':", filter_graph)
+        self.assertIn("[analog]subtitles=filename='captions.ass':", filter_graph)
+        self.assertIn("[video]noise=alls=4:allf=t+u", filter_graph)
+        self.assertIn("drawgrid=width=iw:height=6:thickness=1", filter_graph)
         self.assertIn("fontsdir=", filter_graph)
         self.assertIn("if(lt(t,4.000000)", filter_graph)
         self.assertIn("iw*(if", filter_graph)
@@ -1445,8 +1512,14 @@ class VideoPipelineTests(unittest.TestCase):
 
     # def test_pipeline_retries_for_target_audio_and_repeats_short_source(self) -> None:
     def test_pipeline_retries_for_target_audio_with_temporal_animation_cuts(self) -> None:
+        # scripts = [
+        #     " ".join(f"tentativo{attempt}_parola{index}" for index in range(90))
+        #     for attempt in range(1, 4)
+        # ]
         scripts = [
-            " ".join(f"tentativo{attempt}_parola{index}" for index in range(90))
+            speech.normalize_narration_text(
+                " ".join(f"tentativo{attempt}_parola{index}" for index in range(90))
+            )
             for attempt in range(1, 4)
         ]
         scene = SceneAnalysis(

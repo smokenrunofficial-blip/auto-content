@@ -14,6 +14,7 @@ from .events import report_progress
 from .render import audio_duration, render_vertical_short
 from .speech import (
     load_whisper_model,
+    normalize_narration_text,
     release_whisper_model,
     restore_whisper_model,
     synthesize_narration,
@@ -288,6 +289,7 @@ def run_pipeline(
             language,
             duration_feedback=duration_feedback,
         )
+        script = normalize_narration_text(script)
         report_progress("story_generation", 45, 100, "Script narrativo pronto.")
 
         report_progress(
