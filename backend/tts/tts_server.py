@@ -7,10 +7,13 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
+import struct
 import subprocess
 import tempfile
 import threading
+import unicodedata
 import wave
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
@@ -98,7 +101,37 @@ DEFAULT_PIPER_LENGTH_SCALE = 1.28
 DEFAULT_XTTS_MODEL_NAME = "tts_models/multilingual/multi-dataset/xtts_v2"
 DEFAULT_XTTS_SPEAKER = "Dionisio Schuyler"
 DEFAULT_XTTS_SPEED = 0.92
+DEFAULT_XTTS_TEMPERATURE = 0.65
+DEFAULT_XTTS_TOP_K = 50
+DEFAULT_XTTS_TOP_P = 0.85
+DEFAULT_XTTS_REPETITION_PENALTY = 2.0
 DEFAULT_XTTS_MIN_FREE_VRAM_MB = 5000
+ITALIAN_PRONUNCIATION_OVERRIDES = {
+    "qual'è": "qual è",
+    "un po'": "un poco",
+    "un pò": "un poco",
+    "un po’": "un poco",
+}
+ITALIAN_ABBREVIATIONS = {
+    "p.es.": "per esempio",
+    "dott.": "dottore",
+    "prof.": "professore",
+    "sig.ra": "signora",
+    "sig.": "signore",
+    "es.": "esempio",
+    "ecc.": "eccetera.",
+    "etc.": "eccetera.",
+}
+ITALIAN_ACRONYMS = {
+    "AI": "intelligenza artificiale",
+    "DNA": "di enne a",
+    "GPS": "gi pi esse",
+    "IA": "intelligenza artificiale",
+    "SMS": "esse emme esse",
+    "TV": "tivù",
+    "UE": "Unione Europea",
+    "USA": "Stati Uniti",
+}
 XTTS_SUPPORTED_LANGUAGES = {
     "ar", "cs", "de", "en", "es", "fr", "hi", "hu", "it",
     "ja", "ko", "nl", "pl", "pt", "ru", "tr", "zh-cn",
@@ -219,6 +252,362 @@ def _configured_xtts_speed() -> float:
             detail="XTTS_SPEED deve essere un numero tra 0.5 e 2.",
         )
     return speed
+
+
+def _configured_xtts_float(
+    name: str,
+    default: float,
+    minimum: float,
+    maximum: float,
+) -> float:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{name} deve essere un numero tra {minimum} e {maximum}.",
+        ) from error
+    if not math.isfinite(value) or not minimum <= value <= maximum:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{name} deve essere un numero tra {minimum} e {maximum}.",
+        )
+    return value
+
+
+def _configured_xtts_sampling_options() -> dict[str, float | int]:
+    try:
+        top_k = int(os.environ.get("XTTS_TOP_K", str(DEFAULT_XTTS_TOP_K)))
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="XTTS_TOP_K deve essere un intero tra 1 e 200.",
+        ) from error
+    if not 1 <= top_k <= 200:
+        raise HTTPException(
+            status_code=500,
+            detail="XTTS_TOP_K deve essere un intero tra 1 e 200.",
+        )
+    return {
+        "temperature": _configured_xtts_float(
+            "XTTS_TEMPERATURE",
+            DEFAULT_XTTS_TEMPERATURE,
+            0.01,
+            2.0,
+        ),
+        "top_k": top_k,
+        "top_p": _configured_xtts_float(
+            "XTTS_TOP_P",
+            DEFAULT_XTTS_TOP_P,
+            0.01,
+            1.0,
+        ),
+        "repetition_penalty": _configured_xtts_float(
+            "XTTS_REPETITION_PENALTY",
+            DEFAULT_XTTS_REPETITION_PENALTY,
+            1.0,
+            20.0,
+        ),
+    }
+
+
+_ITALIAN_SMALL_NUMBERS = (
+    "zero",
+    "uno",
+    "due",
+    "tre",
+    "quattro",
+    "cinque",
+    "sei",
+    "sette",
+    "otto",
+    "nove",
+    "dieci",
+    "undici",
+    "dodici",
+    "tredici",
+    "quattordici",
+    "quindici",
+    "sedici",
+    "diciassette",
+    "diciotto",
+    "diciannove",
+)
+_ITALIAN_TENS = (
+    "",
+    "",
+    "venti",
+    "trenta",
+    "quaranta",
+    "cinquanta",
+    "sessanta",
+    "settanta",
+    "ottanta",
+    "novanta",
+)
+
+
+def _italian_under_thousand(number: int) -> str:
+    if number < 20:
+        return _ITALIAN_SMALL_NUMBERS[number]
+    if number < 100:
+        tens, unit = divmod(number, 10)
+        prefix = _ITALIAN_TENS[tens]
+        if unit in {1, 8}:
+            prefix = prefix[:-1]
+        return prefix + (_ITALIAN_SMALL_NUMBERS[unit] if unit else "")
+
+    hundreds, remainder = divmod(number, 100)
+    prefix = "cento" if hundreds == 1 else f"{_ITALIAN_SMALL_NUMBERS[hundreds]}cento"
+    if remainder == 8 or 80 <= remainder < 90:
+        prefix = prefix[:-1]
+    return prefix + (_italian_under_thousand(remainder) if remainder else "")
+
+
+def _italian_integer_to_words(number: int) -> str:
+    if number < 0:
+        return f"meno {_italian_integer_to_words(-number)}"
+    if number < 1000:
+        return _italian_under_thousand(number)
+    if number < 1_000_000:
+        thousands, remainder = divmod(number, 1000)
+        prefix = "mille" if thousands == 1 else f"{_italian_under_thousand(thousands)}mila"
+        return prefix + (_italian_under_thousand(remainder) if remainder else "")
+    if number < 1_000_000_000:
+        millions, remainder = divmod(number, 1_000_000)
+        noun = "milione" if millions == 1 else "milioni"
+        prefix = "un milione" if millions == 1 else f"{_italian_integer_to_words(millions)} {noun}"
+        if remainder:
+            prefix += f" {_italian_integer_to_words(remainder)}"
+        return prefix
+    if number < 1_000_000_000_000:
+        billions, remainder = divmod(number, 1_000_000_000)
+        noun = "miliardo" if billions == 1 else "miliardi"
+        prefix = "un miliardo" if billions == 1 else f"{_italian_integer_to_words(billions)} {noun}"
+        if remainder:
+            prefix += f" {_italian_integer_to_words(remainder)}"
+        return prefix
+    return " ".join(_ITALIAN_SMALL_NUMBERS[int(digit)] for digit in str(number))
+
+
+def _italian_number_to_words(value: str) -> str:
+    value = value.strip()
+    separator = "," if "," in value else "."
+    if separator in value:
+        integer_part, fractional_part = value.rsplit(separator, 1)
+        if separator == "." and len(fractional_part) == 3:
+            value = integer_part + fractional_part
+        elif fractional_part.isdigit():
+            integer_value = int(integer_part.replace(".", "") or "0")
+            spoken_fraction = " ".join(
+                _ITALIAN_SMALL_NUMBERS[int(digit)] for digit in fractional_part
+            )
+            return f"{_italian_integer_to_words(integer_value)} virgola {spoken_fraction}"
+    return _italian_integer_to_words(int(value.replace(".", "").replace(",", "")))
+
+
+def _configured_italian_pronunciation_overrides() -> dict[str, str]:
+    overrides = dict(ITALIAN_PRONUNCIATION_OVERRIDES)
+    raw_value = os.environ.get("XTTS_ITALIAN_PRONUNCIATION_OVERRIDES", "").strip()
+    if not raw_value:
+        return overrides
+    try:
+        configured = json.loads(raw_value)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=500,
+            detail="XTTS_ITALIAN_PRONUNCIATION_OVERRIDES deve essere un oggetto JSON.",
+        ) from error
+    if not isinstance(configured, dict) or any(
+        not isinstance(source, str)
+        or not source.strip()
+        or not isinstance(replacement, str)
+        or not replacement.strip()
+        for source, replacement in configured.items()
+    ):
+        raise HTTPException(
+            status_code=500,
+            detail="Gli override XTTS devono mappare parole non vuote in stringhe.",
+        )
+    overrides.update(configured)
+    return overrides
+
+
+def prepare_italian_tts_text(text: str) -> str:
+    text = unicodedata.normalize("NFC", text)
+    text = re.sub(r"(?<!\w)n(?:\.|º|°)\s*(?=\d)", "numero ", text, flags=re.IGNORECASE)
+
+    def expand_time(match: re.Match[str]) -> str:
+        original_prefix = match.group(1) or ""
+        prefix = original_prefix.casefold()
+        hour = int(match.group(2))
+        minute = int(match.group(3))
+        if hour == 0 and minute == 0:
+            return "mezzanotte"
+        if hour == 0:
+            return f"mezzanotte e {_italian_integer_to_words(minute)}"
+        hour_words = "una" if hour == 1 else _italian_integer_to_words(hour)
+        if minute == 0:
+            time_words = f"{hour_words} in punto"
+        else:
+            time_words = (
+                f"{hour_words} e {_italian_integer_to_words(minute)}"
+            )
+        if hour == 1:
+            if prefix in {"alle", "all'"}:
+                result = f"all'{time_words}"
+            elif prefix == "le" or not prefix:
+                result = f"l'{time_words}"
+            else:
+                result = f"{original_prefix} {time_words}"
+            if match.start() == 0 or original_prefix[:1].isupper():
+                result = result[0].upper() + result[1:]
+            return result
+        if prefix:
+            return f"{original_prefix} {time_words}"
+        prefix_text = "Le" if match.start() == 0 else "le"
+        return f"{prefix_text} {time_words}"
+
+    text = re.sub(
+        r"(?<!\w)(?:(alle|all'|le|ore)\s+)?(\d{1,2}):([0-5]\d)(?!\w)",
+        expand_time,
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?<!\w)(\d+(?:[.,]\d+)*)\s*%",
+        lambda match: f"{_italian_number_to_words(match.group(1))} per cento",
+        text,
+    )
+    text = re.sub(
+        r"(?<!\w)(\d+(?:[.,]\d+)*)\s*€",
+        lambda match: f"{_italian_number_to_words(match.group(1))} euro",
+        text,
+    )
+    for abbreviation, replacement in sorted(
+        ITALIAN_ABBREVIATIONS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        text = re.sub(
+            rf"(?<!\w){re.escape(abbreviation)}(?=\s|[,!?;:]|$)",
+            replacement,
+            text,
+            flags=re.IGNORECASE,
+        )
+    for acronym, replacement in sorted(
+        ITALIAN_ACRONYMS.items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        text = re.sub(
+            rf"(?<!\w){re.escape(acronym)}(?!\w)",
+            replacement,
+            text,
+        )
+    text = re.sub(
+        r"(?<!\w)\d+(?:[.,]\d+)*(?!\w)",
+        lambda match: _italian_number_to_words(match.group(0)),
+        text,
+    )
+    for source, replacement in sorted(
+        _configured_italian_pronunciation_overrides().items(),
+        key=lambda item: len(item[0]),
+        reverse=True,
+    ):
+        text = re.sub(
+            rf"(?<!\w){re.escape(source)}(?!\w)",
+            replacement,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    text = re.sub(r"[-‐‑–—]{2,}", " — ", text)
+    text = re.sub(r'["“”]{2,}', '"', text)
+    text = "".join(
+        character
+        for character in text
+        if character.isspace()
+        or unicodedata.category(character)[0] in {"L", "M", "N"}
+        or character in ".,!?;:…'’‘\"“”«»—–-()[]"
+    )
+    text = re.sub(r"\s+([,.;:!?…])", r"\1", text)
+    text = re.sub(r"([,;:!?…])(?=\S)", r"\1 ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Testo italiano vuoto dopo la normalizzazione.")
+    closing_quotes = "\"'’”»)]"
+    body = text.rstrip(closing_quotes)
+    if not body.endswith((".", "!", "?", "…")):
+        suffix = text[len(body) :]
+        body = body.rstrip(",;:—–- ") + "."
+        # text = body + text[len(body.rstrip(".")) :]
+        text = body + suffix
+    return text
+
+
+def _split_sentences_for_tts(text: str) -> list[str]:
+    sentences: list[str] = []
+    start = 0
+    index = 0
+    closing_quotes = "\"'’”»)]"
+    while index < len(text):
+        if text[index] not in ".!?…:;":
+            index += 1
+            continue
+        end = index + 1
+        while end < len(text) and text[end] in ".!?…:;":
+            end += 1
+        while end < len(text) and text[end] in closing_quotes:
+            end += 1
+        if end == len(text) or text[end].isspace():
+            sentence = text[start:end].strip()
+            if sentence:
+                sentences.append(sentence)
+            while end < len(text) and text[end].isspace():
+                end += 1
+            start = end
+            index = end
+        else:
+            index = end
+    if start < len(text):
+        remainder = text[start:].strip()
+        if remainder:
+            sentences.append(remainder)
+    return sentences
+
+
+def _split_long_tts_sentence(sentence: str, max_words: int = 28) -> list[str]:
+    if len(sentence.split()) <= max_words:
+        return [sentence]
+    clauses = re.split(r"(?<=,)\s+", sentence)
+    chunks: list[str] = []
+    current: list[str] = []
+    for clause in clauses:
+        words = clause.split()
+        if current and len(current) + min(len(words), max_words) > max_words:
+            chunks.append(" ".join(current))
+            current = []
+        while len(words) > max_words:
+            piece = words[:max_words]
+            if not re.search(r"[,;:]$", piece[-1]):
+                piece[-1] += ","
+            chunks.append(" ".join(piece))
+            words = words[max_words:]
+        current.extend(words)
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+
+
+def split_italian_tts_text(text: str, max_words: int = 28) -> list[str]:
+    prepared = prepare_italian_tts_text(text)
+    return [
+        chunk
+        for sentence in _split_sentences_for_tts(prepared)
+        for chunk in _split_long_tts_sentence(sentence, max_words)
+    ]
 
 
 def _configured_min_free_vram_mb() -> int:
@@ -393,17 +782,106 @@ def _configured_voice_reference() -> Path | None:
         )
     try:
         with wave.open(str(reference_path), "rb") as reference_audio:
-            if reference_audio.getframerate() <= 0 or reference_audio.getnframes() <= 0:
+            frame_rate = reference_audio.getframerate()
+            frame_count = reference_audio.getnframes()
+            channel_count = reference_audio.getnchannels()
+            sample_width = reference_audio.getsampwidth()
+            if frame_rate <= 0 or frame_count <= 0:
                 raise HTTPException(
                     status_code=500,
                     detail="VOICE_REFERENCE_WAV è vuoto o non valido.",
                 )
+            duration_seconds = frame_count / frame_rate
+            if not 1.0 <= duration_seconds <= 30.0:
+                raise HTTPException(
+                    status_code=500,
+                    detail="VOICE_REFERENCE_WAV deve durare tra 1 e 30 secondi.",
+                )
+            if not 16_000 <= frame_rate <= 96_000:
+                raise HTTPException(
+                    status_code=500,
+                    detail="VOICE_REFERENCE_WAV deve avere una frequenza tra 16 e 96 kHz.",
+                )
+            if channel_count not in {1, 2} or sample_width not in {1, 2, 3, 4}:
+                raise HTTPException(
+                    status_code=500,
+                    detail="VOICE_REFERENCE_WAV deve essere PCM mono o stereo valido.",
+                )
+            sample_peak, sample_rms, clipped_ratio = _voice_reference_levels(
+                reference_audio,
+                frame_count,
+                channel_count,
+                sample_width,
+            )
+            if sample_rms < 0.001:
+                raise HTTPException(
+                    status_code=500,
+                    detail="VOICE_REFERENCE_WAV è quasi silenzioso o troppo debole.",
+                )
+            if clipped_ratio > 0.005:
+                raise HTTPException(
+                    status_code=500,
+                    detail="VOICE_REFERENCE_WAV è distorto o presenta clipping eccessivo.",
+                )
+            LOGGER.info(
+                "VOICE_REFERENCE_WAV verificato: durata %.2fs, frequenza %d Hz, "
+                "%d canali, %d byte/campione, picco %.3f, RMS %.3f, clipping %.2f%%. "
+                "La presenza di musica o riverbero marcato richiede ascolto manuale.",
+                duration_seconds,
+                frame_rate,
+                channel_count,
+                sample_width,
+                sample_peak,
+                sample_rms,
+                clipped_ratio * 100,
+            )
     except (OSError, wave.Error) as error:
         raise HTTPException(
             status_code=500,
             detail=f"VOICE_REFERENCE_WAV non è un WAV leggibile: {error}",
         ) from error
     return reference_path
+
+
+def _voice_reference_levels(
+    audio_file: wave.Wave_read,
+    frame_count: int,
+    channel_count: int,
+    sample_width: int,
+) -> tuple[float, float, float]:
+    maximum_sample = (1 << (sample_width * 8 - 1)) - 1
+    sample_count = 0
+    clipped_count = 0
+    squared_sum = 0.0
+    peak = 0
+    audio_file.rewind()
+    while raw_frames := audio_file.readframes(8192):
+        if sample_width == 1:
+            samples = (value - 128 for value in raw_frames)
+            maximum_sample = 128
+        elif sample_width == 2:
+            samples = (value[0] for value in struct.iter_unpack("<h", raw_frames))
+        elif sample_width == 3:
+            samples = (
+                int.from_bytes(raw_frames[index : index + 3], "little", signed=True)
+                for index in range(0, len(raw_frames), 3)
+            )
+        else:
+            samples = (value[0] for value in struct.iter_unpack("<i", raw_frames))
+        for sample in samples:
+            magnitude = abs(sample)
+            peak = max(peak, magnitude)
+            squared_sum += magnitude * magnitude
+            sample_count += 1
+            if magnitude >= maximum_sample * 0.999:
+                clipped_count += 1
+    if sample_count == 0 or frame_count <= 0 or channel_count <= 0:
+        return 0.0, 0.0, 0.0
+    return (
+        peak / maximum_sample,
+        math.sqrt(squared_sum / sample_count) / maximum_sample,
+        clipped_count / sample_count,
+    )
 
 
 def _validate_wav_file(path: Path, label: str) -> None:
@@ -423,9 +901,103 @@ def _validate_wav_file(path: Path, label: str) -> None:
         ) from error
 
 
-def _apply_audio_filters(source_path: Path) -> bytes:
+def _pause_after_tts_chunk(text: str) -> float:
+    ending = text.rstrip("\"'’”»)]").rstrip()
+    if ending.endswith(","):
+        return 0.15
+    if ending.endswith((":", ";")):
+        return 0.20
+    if ending.endswith(("...", "…", "?", "!")):
+        return 0.28
+    return 0.24
+
+
+def _synthesize_xtts_chunks(
+    model: Any,
+    text: str,
+    output_path: Path,
+    reference_path: Path | None,
+    speaker: str,
+    speed: float,
+    sampling_options: dict[str, float | int],
+) -> None:
+    chunks = split_italian_tts_text(text)
+    if not chunks:
+        raise HTTPException(status_code=400, detail="Testo italiano vuoto per XTTS.")
+    LOGGER.info(
+        "Sintesi XTTS italiana in %d segmenti brevi; pause tra i segmenti basate "
+        "sulla punteggiatura.",
+        len(chunks),
+    )
+
+    combined_frames = bytearray()
+    output_params: Any | None = None
+    with tempfile.TemporaryDirectory(prefix="xtts_chunks_") as temporary_directory:
+        for index, chunk in enumerate(chunks):
+            chunk_path = Path(temporary_directory) / f"chunk_{index:03d}.wav"
+            model.tts_to_file(
+                text=chunk,
+                file_path=str(chunk_path),
+                language="it",
+                speaker=None if reference_path else speaker,
+                speaker_wav=str(reference_path) if reference_path else None,
+                split_sentences=False,
+                speed=speed,
+                **sampling_options,
+            )
+            _validate_wav_file(chunk_path, f"XTTS segmento {index + 1}")
+            with wave.open(str(chunk_path), "rb") as audio_file:
+                params = audio_file.getparams()
+                if params.comptype != "NONE":
+                    raise HTTPException(
+                        status_code=500,
+                        detail="XTTS ha prodotto audio WAV compresso non concatenabile.",
+                    )
+                if output_params is None:
+                    output_params = params
+                elif (
+                    params.nchannels,
+                    params.sampwidth,
+                    params.framerate,
+                    params.comptype,
+                ) != (
+                    output_params.nchannels,
+                    output_params.sampwidth,
+                    output_params.framerate,
+                    output_params.comptype,
+                ):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="I segmenti XTTS hanno parametri audio incompatibili.",
+                    )
+                combined_frames.extend(
+                    audio_file.readframes(audio_file.getnframes())
+                )
+            if index < len(chunks) - 1 and output_params is not None:
+                pause_frames = round(
+                    output_params.framerate * _pause_after_tts_chunk(chunk)
+                )
+                silence_sample = b"\x80" if output_params.sampwidth == 1 else b"\x00"
+                combined_frames.extend(
+                    silence_sample
+                    * pause_frames
+                    * output_params.nchannels
+                    * output_params.sampwidth
+                )
+
+    if output_params is None:
+        raise HTTPException(status_code=500, detail="XTTS non ha prodotto audio.")
+    with wave.open(str(output_path), "wb") as output_audio:
+        output_audio.setnchannels(output_params.nchannels)
+        output_audio.setsampwidth(output_params.sampwidth)
+        output_audio.setframerate(output_params.framerate)
+        output_audio.writeframes(combined_frames)
+
+
+def _apply_audio_filters(source_path: Path, *, apply_speed: bool = True) -> bytes:
     filters: list[str] = []
-    speed = _configured_xtts_speed()
+    # speed = _configured_xtts_speed()
+    speed = _configured_xtts_speed() if apply_speed else 1.0
     if speed != 1.0:
         filters.append(f"atempo={speed:g}")
     extra_filter = os.environ.get("TTS_AUDIO_FILTER", "").strip()
@@ -492,8 +1064,19 @@ def _synthesize_with_xtts(req: TTSRequest, language: str) -> bytes:
         raise HTTPException(status_code=500, detail="XTTS_MODEL_NAME non può essere vuoto.")
     reference_path = _configured_voice_reference()
     speaker = os.environ.get("XTTS_SPEAKER", DEFAULT_XTTS_SPEAKER).strip()
+    speed = _configured_xtts_speed()
+    sampling_options = _configured_xtts_sampling_options()
     if reference_path is None and not speaker:
         raise HTTPException(status_code=500, detail="XTTS_SPEAKER non può essere vuoto.")
+    LOGGER.info(
+        "Parametri XTTS: speed=%.2f, temperature=%.2f, top_k=%d, top_p=%.2f, "
+        "repetition_penalty=%.2f.",
+        speed,
+        sampling_options["temperature"],
+        sampling_options["top_k"],
+        sampling_options["top_p"],
+        sampling_options["repetition_penalty"],
+    )
 
     _unload_pipeline_ollama_models()
     _clear_xtts_cuda_cache(torch, unload_model=False)
@@ -567,16 +1150,38 @@ def _synthesize_with_xtts(req: TTSRequest, language: str) -> bytes:
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary_file:
             output_path = Path(temporary_file.name)
-        model.tts_to_file(
-            text=req.text.strip(),
-            file_path=str(output_path),
-            language=language,
-            speaker=None if reference_path else speaker,
-            speaker_wav=str(reference_path) if reference_path else None,
-            split_sentences=True,
-        )
+        if language == "it":
+            # model.tts_to_file(
+            #     text=req.text.strip(),
+            #     file_path=str(output_path),
+            #     language=language,
+            #     speaker=None if reference_path else speaker,
+            #     speaker_wav=str(reference_path) if reference_path else None,
+            #     split_sentences=True,
+            # )
+            _synthesize_xtts_chunks(
+                model,
+                req.text.strip(),
+                output_path,
+                reference_path,
+                speaker,
+                speed,
+                sampling_options,
+            )
+        else:
+            model.tts_to_file(
+                text=req.text.strip(),
+                file_path=str(output_path),
+                language=language,
+                speaker=None if reference_path else speaker,
+                speaker_wav=str(reference_path) if reference_path else None,
+                split_sentences=True,
+                speed=speed,
+                **sampling_options,
+            )
         _validate_wav_file(output_path, "XTTS")
-        return _apply_audio_filters(output_path)
+        # return _apply_audio_filters(output_path)
+        return _apply_audio_filters(output_path, apply_speed=False)
     except RuntimeError as error:
         if "out of memory" not in str(error).casefold():
             raise

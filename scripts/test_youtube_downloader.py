@@ -92,14 +92,16 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertEqual(len(selected), 10)
         self.assertEqual(selected[0], ideal)
 
-    def test_main_accepts_ten_video_candidates(self) -> None:
+    # def test_main_accepts_ten_video_candidates(self) -> None:
+    def test_main_accepts_five_video_candidates(self) -> None:
         stdout = io.StringIO()
         stderr = io.StringIO()
         with (
             patch.object(
                 youtube_downloader.sys,
                 "argv",
-                ["youtube_downloader.py", "--keyword", "ceramica", "--limit", "10"],
+                # ["youtube_downloader.py", "--keyword", "ceramica", "--limit", "10"],
+                ["youtube_downloader.py", "--keyword", "ceramica", "--limit", "5"],
             ),
             patch.object(youtube_downloader.sys, "stdout", stdout),
             patch.object(youtube_downloader.sys, "stderr", stderr),
@@ -109,8 +111,23 @@ class AllowedLicenseTests(unittest.TestCase):
 
         self.assertEqual(result_code, 0)
         download.assert_called_once()
-        self.assertEqual(download.call_args.args[:2], ("ceramica", 10))
+        # self.assertEqual(download.call_args.args[:2], ("ceramica", 10))
+        self.assertEqual(download.call_args.args[:2], ("ceramica", 5))
         self.assertTrue(callable(download.call_args.args[2]))
+
+    def test_main_rejects_more_than_five_video_candidates(self) -> None:
+        with (
+            patch.object(
+                youtube_downloader.sys,
+                "argv",
+                ["youtube_downloader.py", "--keyword", "ceramica", "--limit", "6"],
+            ),
+            patch.object(youtube_downloader.sys, "stderr", io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as error:
+                youtube_downloader.main()
+
+        self.assertEqual(error.exception.code, 2)
 
     def test_main_can_export_browser_cookies_without_a_search_keyword(self) -> None:
         stdout = io.StringIO()
@@ -314,7 +331,10 @@ class AllowedLicenseTests(unittest.TestCase):
 
         self.assertEqual(selected, [candidates[1]])
 
-    def test_search_verifies_full_metadata_and_reports_download_progress(self) -> None:
+    # def test_search_verifies_full_metadata_and_reports_download_progress(self) -> None:
+    def test_search_uses_flat_results_then_downloads_selected_metadata(self) -> None:
+        calls = []
+
         class FakeYouTubeDL:
             def __init__(self, options):
                 self.options = options
@@ -326,11 +346,18 @@ class AllowedLicenseTests(unittest.TestCase):
                 return not exc_info
 
             def extract_info(self, url, download=False):
+                calls.append((url, download))
                 if url.startswith("ytsearch"):
                     return {
                         "entries": [
-                            {"webpage_url": "https://youtube.com/watch?v=bad12345"},
-                            {"webpage_url": "https://youtube.com/watch?v=abc12345"},
+                            {
+                                "webpage_url": "https://youtube.com/watch?v=bad12345",
+                                "duration": 720,
+                            },
+                            {
+                                "webpage_url": "https://youtube.com/watch?v=abc12345",
+                                "duration": 420,
+                            },
                         ]
                     }
                 if not download:
@@ -377,6 +404,13 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertTrue(any(event["stage"] == "search" for event in events))
         self.assertTrue(any(event["stage"] == "download" for event in events))
         self.assertTrue(any(event["stage"] == "download" and event["stage_progress"] == 100 for event in events))
+        self.assertEqual(
+            calls,
+            [
+                ("ytsearch10:ceramica artigianale", False),
+                ("https://youtube.com/watch?v=abc12345", True),
+            ],
+        )
 
     def test_search_filters_before_download_and_sorts_ideal_landscape_first(self) -> None:
         metadata_by_id = {
@@ -422,7 +456,10 @@ class AllowedLicenseTests(unittest.TestCase):
                 if url.startswith("ytsearch"):
                     return {
                         "entries": [
-                            {"webpage_url": f"https://youtube.com/watch?v={video_id}"}
+                            {
+                                "webpage_url": f"https://youtube.com/watch?v={video_id}",
+                                **metadata_by_id[video_id],
+                            }
                             for video_id in metadata_by_id
                         ]
                         + [
@@ -466,7 +503,8 @@ class AllowedLicenseTests(unittest.TestCase):
         self.assertEqual(downloaded_ids, ["ideal12345"])
         self.assertEqual([video["id"] for video in videos], ["ideal12345"])
 
-    def test_cookie_file_is_passed_to_search_metadata_and_download_calls(self) -> None:
+    # def test_cookie_file_is_passed_to_search_metadata_and_download_calls(self) -> None:
+    def test_cookie_and_rate_limits_are_passed_to_search_and_download(self) -> None:
         captured_options = []
         metadata = {
             "id": "cookie12345",
@@ -507,9 +545,20 @@ class AllowedLicenseTests(unittest.TestCase):
                 videos = youtube_downloader.download_matches("ceramica", 1)
 
         self.assertEqual(len(videos), 1)
-        self.assertEqual(len(captured_options), 3)
+        # self.assertEqual(len(captured_options), 3)
+        self.assertEqual(len(captured_options), 2)
+        self.assertTrue(captured_options[0]["extract_flat"])
+        self.assertNotIn("extract_flat", captured_options[1])
         self.assertTrue(
             all(options.get("cookiefile") == str(cookie_file) for options in captured_options)
+        )
+        self.assertTrue(
+            all(
+                options.get("sleep_interval_requests") == 1.5
+                and options.get("sleep_interval") == 3
+                and options.get("max_sleep_interval") == 6
+                for options in captured_options
+            )
         )
         self.assertTrue(
             all(

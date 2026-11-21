@@ -20,7 +20,8 @@ from yt_dlp.cookies import extract_cookies_from_browser
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DOWNLOAD_DIR = PROJECT_ROOT / "downloads"
 # MAX_LIMIT = 3
-MAX_LIMIT = 10
+# MAX_LIMIT = 10
+MAX_LIMIT = 5
 MIN_SOURCE_VIDEO_DURATION_SECONDS = 60
 MAX_SOURCE_VIDEO_DURATION_SECONDS = 900
 IDEAL_SOURCE_VIDEO_DURATION_MIN_SECONDS = 300
@@ -174,6 +175,54 @@ def _add_youtube_extractor_args(options: dict[str, Any]) -> None:
     options["extractor_args"] = {
         "youtube": {"player_client": ["default", "web", "android"]}
     }
+
+
+def _add_youtube_request_delays(options: dict[str, Any]) -> None:
+    options.update(
+        sleep_interval_requests=1.5,
+        sleep_interval=3,
+        max_sleep_interval=6,
+    )
+
+
+def _flat_search_candidates(entries: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if entries is None or isinstance(entries, (str, bytes, dict)):
+        return candidates
+    try:
+        entry_iterator = iter(entries)
+    except TypeError:
+        return candidates
+    for entry in entry_iterator:
+        if not isinstance(entry, dict):
+            continue
+        entry_url = str(entry.get("webpage_url") or entry.get("url") or "").strip()
+        if not entry_url:
+            entry_url = str(entry.get("id") or "").strip()
+        if not entry_url:
+            continue
+        if not entry_url.startswith(("http://", "https://")):
+            video_id = str(entry.get("id") or entry_url).strip()
+            if not video_id:
+                continue
+            entry_url = f"https://www.youtube.com/watch?v={video_id}"
+        if _is_shorts_url(entry_url):
+            continue
+
+        candidate = dict(entry)
+        candidate["webpage_url"] = entry_url
+        duration = _positive_number(candidate.get("duration"))
+        if duration is not None and not (
+            MIN_SOURCE_VIDEO_DURATION_SECONDS
+            <= duration
+            <= MAX_SOURCE_VIDEO_DURATION_SECONDS
+        ):
+            continue
+        width, height = _video_dimensions(candidate)
+        if width is not None and height is not None and height > width:
+            continue
+        candidates.append(candidate)
+    return candidates
 
 
 def youtube_auth_required(error: BaseException | str) -> bool:
@@ -395,16 +444,18 @@ def download_matches(
     limit: int,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> list[dict[str, str]]:
-    # search_limit = min(limit * 5, 25)
-    search_limit = min(max(limit * 20, 50), 100)
+    # search_limit = min(max(limit * 20, 50), 100)
+    search_limit = min(max(limit * 5, 10), 25)
     search_options: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "extract_flat": True,
     }
     _add_youtube_extractor_args(search_options)
     _add_cookie_file_option(search_options)
+    _add_youtube_request_delays(search_options)
 
     with yt_dlp.YoutubeDL(search_options) as searcher:
         if progress_callback:
@@ -422,64 +473,49 @@ def download_matches(
         )
 
     entries = search_result.get("entries", []) if search_result else []
-    candidates: list[dict[str, Any]] = []
-    with yt_dlp.YoutubeDL(search_options) as searcher:
-        for index, entry in enumerate(entries):
-            # if not entry or not entry.get("webpage_url"):
-            if not isinstance(entry, dict):
-                continue
-            entry_url = str(entry.get("webpage_url") or entry.get("url") or "")
-            if not entry_url:
-                continue
-            if _is_shorts_url(entry_url) or _is_shorts_url(str(entry.get("url", ""))):
-                continue
-            # metadata = searcher.extract_info(entry_url, download=False)
-            try:
-                metadata = searcher.extract_info(entry_url, download=False)
-            except (OSError, yt_dlp.utils.DownloadError) as error:
-                metadata = dict(entry)
-                if progress_callback:
-                    progress_callback(
-                        {
-                            "type": "progress",
-                            "stage": "search",
-                            "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
-                            "message": (
-                                f"Metadati candidato {index + 1}/{len(entries)} "
-                                # f"non disponibili; uso i dati della ricerca ({error})."
-                                f"non disponibili; uso i dati della ricerca "
-                                f"({friendly_download_error(error)})."
-                            ),
-                        }
-                    )
-            if not isinstance(metadata, dict) or not metadata:
-                # Keep the usable search result as a last-resort candidate.
-                metadata = dict(entry)
-            metadata.setdefault("webpage_url", entry_url)
-            if not _is_shorts_url(str(metadata.get("webpage_url", ""))):
-                # if (
-                #     has_allowed_license(metadata.get("license"))
-                #     and _candidate_is_eligible(metadata, entry_url)
-                # ):
-                candidates.append(metadata)
-            if progress_callback:
-                progress_callback(
-                    {
-                        "type": "progress",
-                        "stage": "search",
-                        "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
-                        # "message": f"Verifica licenze dei risultati ({index + 1}/{len(entries)}).",
-                        "message": (
-                            "Verifica durata, orientamento e alternative dei risultati "
-                            f"({index + 1}/{len(entries)})."
-                        ),
-                    }
-                )
-            # if len(candidates) >= limit:
-            #     break
-
-    # candidates.sort(key=_candidate_priority, reverse=True)
-    # candidates = candidates[:limit]
+    # candidates: list[dict[str, Any]] = []
+    # with yt_dlp.YoutubeDL(search_options) as searcher:
+    #     for index, entry in enumerate(entries):
+    #         if not isinstance(entry, dict):
+    #             continue
+    #         entry_url = str(entry.get("webpage_url") or entry.get("url") or "")
+    #         if not entry_url:
+    #             continue
+    #         try:
+    #             metadata = searcher.extract_info(entry_url, download=False)
+    #         except (OSError, yt_dlp.utils.DownloadError) as error:
+    #             metadata = dict(entry)
+    #             if progress_callback:
+    #                 progress_callback(
+    #                     {
+    #                         "type": "progress",
+    #                         "stage": "search",
+    #                         "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
+    #                         "message": (
+    #                             f"Metadati candidato {index + 1}/{len(entries)} "
+    #                             f"non disponibili; uso i dati della ricerca "
+    #                             f"({friendly_download_error(error)})."
+    #                         ),
+    #                     }
+    #                 )
+    #         if not isinstance(metadata, dict) or not metadata:
+    #             metadata = dict(entry)
+    #         metadata.setdefault("webpage_url", entry_url)
+    #         if not _is_shorts_url(str(metadata.get("webpage_url", ""))):
+    #             candidates.append(metadata)
+    #         if progress_callback:
+    #             progress_callback(
+    #                 {
+    #                     "type": "progress",
+    #                     "stage": "search",
+    #                     "stage_progress": int((index + 1) * 100 / max(1, len(entries))),
+    #                     "message": (
+    #                         "Verifica durata, orientamento e alternative dei risultati "
+    #                         f"({index + 1}/{len(entries)})."
+    #                     ),
+    #                 }
+    #             )
+    candidates = _flat_search_candidates(entries)
     candidates = _select_candidates(candidates, limit)
     if progress_callback:
         progress_callback(
@@ -553,6 +589,7 @@ def download_matches(
     }
     _add_youtube_extractor_args(download_options)
     _add_cookie_file_option(download_options)
+    _add_youtube_request_delays(download_options)
     if progress_callback:
         download_options["progress_hooks"] = [report_download_progress]
     downloaded: list[dict[str, str]] = []
@@ -626,7 +663,8 @@ def main() -> int:
         help="Salva la sessione YouTube del browser nella cache persistente",
     )
     # parser.add_argument("--limit", type=int, default=2, help="Numero massimo di download (1-3)")
-    parser.add_argument("--limit", type=int, default=2, help="Numero massimo di candidati (1-10)")
+    # parser.add_argument("--limit", type=int, default=2, help="Numero massimo di candidati (1-10)")
+    parser.add_argument("--limit", type=int, default=2, help="Numero massimo di candidati (1-5)")
     parser.add_argument(
         "--progress",
         action="store_true",
